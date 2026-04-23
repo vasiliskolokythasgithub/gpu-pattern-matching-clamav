@@ -133,9 +133,7 @@ static inline cl_error_t matcher_run(const struct cli_matcher *root,
                                      cli_ctx *ctx)
 {
    
-    cli_dbgmsg("MATCHER_RUN called: root=%p, length=%u, ctx=%p, gpu_enabled=%d\n",
-           (void*)root, length, (void*)ctx, root ? root->gpu_enabled : -1);
- 
+     
     cl_error_t ret, saved_ret = CL_CLEAN;
   
     int32_t pos = 0;
@@ -193,7 +191,6 @@ static inline cl_error_t matcher_run(const struct cli_matcher *root,
 
 
     
-        if (!ctx->gpu_ac_done) {
  
           ret = cli_ac_scanbuff(buffer, length, virname, NULL, acres, root, mdata, offset, ftype, ftoffset, acmode, ctx);
            
@@ -210,7 +207,7 @@ static inline cl_error_t matcher_run(const struct cli_matcher *root,
                 return ret;
             }
         }
-        }
+      
         
   
     if (root->bcomp_metas) {
@@ -333,6 +330,8 @@ cl_error_t cli_scan_buff(const unsigned char *buffer, uint32_t length, uint32_t 
         }
     }
 
+          
+
     if (target_ac_root) {
         /* If a target-specific specific signature root was found for the given file type, match with it. */
 
@@ -344,7 +343,7 @@ cl_error_t cli_scan_buff(const unsigned char *buffer, uint32_t length, uint32_t 
             }
         }
 
-        ret = matcher_run(target_ac_root, buffer, length, &virname,
+        ret = matcher_run(generic_ac_root, buffer, length, &virname,
                           acdata ? (acdata[0]) : (&matcher_data),
                           offset, NULL, ftype, NULL, AC_SCAN_VIR, PCRE_SCAN_BUFF, NULL, ctx->fmap, NULL, NULL, ctx);
 
@@ -1333,36 +1332,73 @@ cl_error_t cli_scan_fmap(cli_ctx *ctx, cli_file_t ftype, bool filetype_only, str
         }
     }
 
+//     fprintf(stderr, "=== GPU CONDITION CHECK ===\n");
+// fprintf(stderr, "  root[1] exists: %s\n", ctx->engine->root[1] ? "YES" : "NO");
+// if (ctx->engine->root[1]) {
+//     fprintf(stderr, "  root[1]->gpu_enabled: %d\n", ctx->engine->root[1]->gpu_enabled);
+//     fprintf(stderr, "  root[1]->gpu_dfa_states: %u\n", ctx->engine->root[1]->gpu_dfa_states);
+// }
+// fprintf(stderr, "  gpu_rt exists: %s\n", ctx->engine->gpu_rt ? "YES" : "NO");
+// if (ctx->engine->gpu_rt) {
+//     fprintf(stderr, "  gpu_rt->dfa_uploaded: %d\n", ctx->engine->gpu_rt->dfa_uploaded);
+// }
+// fprintf(stderr, "  file_length: %zu (>= 256KB: %s)\n", ctx->fmap->len, 
+//         ctx->fmap->len >= 256 * 1024 ? "YES" : "NO");
+// fprintf(stderr, "  gpu_rt = %p\n", (void*)ctx->engine->gpu_rt);
+// fprintf(stderr, "  file_length = %zu\n", ctx->fmap->len);
+// fprintf(stderr, "  maxpatlen = %u (from gpu_rt->maxpatlen)\n", ctx->engine->root[1]->maxpatlen);
+// fprintf(stderr, "  ctx = %p\n", (void*)ctx);
+// fprintf(stderr, "  tinfo = %p\n", (void*)&info);
 #ifdef HAVE_OPENCL
     ctx->gpu_ac_done = false;
-        // fprintf(stderr, "GPU_CHECK: gpu_enabled=%d, dfa_states=%p, gpu_rt=%p, dfa_uploaded=%d, len=%zu\n",
-        //     generic_ac_root ? generic_ac_root->gpu_enabled : -1,
-        //     generic_ac_root ? (void*)generic_ac_root->gpu_dfa_states : NULL,
-        //     (void*)ctx->engine->gpu_rt,
-        //     ctx->engine->gpu_rt ? ctx->engine->gpu_rt->dfa_uploaded : -1,
-        //     ctx->fmap->len);
+        fprintf(stderr, "GPU_CHECK: gpu_enabled=%d, dfa_states=%u, gpu_rt=%p, dfa_uploaded=%d, len=%zu\n",
+    ctx->engine->root[1] ? ctx->engine->root[1]->gpu_enabled : -1,
+    ctx->engine->root[1] ? ctx->engine->root[1]->gpu_dfa_states : 0,
+    (void*)ctx->engine->gpu_rt,
+    ctx->engine->gpu_rt ? ctx->engine->gpu_rt->dfa_uploaded : -1,
+    ctx->fmap->len);
 
 //     if (ftype == CL_TYPE_PE || ftype == CL_TYPE_ELF || ftype == CL_TYPE_MACHO) {
 //      fprintf(stderr, "  PE FILE SKIPPING TO CPU\n");
 //     goto cpu_scan;
 // }
-    if (generic_ac_root && generic_ac_root->gpu_enabled && 
-        generic_ac_root->gpu_dfa_states &&
-        ctx->engine->gpu_rt && ctx->engine->gpu_rt->dfa_uploaded  &&
-        ctx->fmap->len >=  256 * 1024) {
-        
+
+//CHANGE THIS
+
+// if (ctx->engine->root[0]  &&
+//     ctx->engine->gpu_rt && 
+//     ctx->engine->root[1]->gpu_enabled &&
+//     ctx->engine->gpu_rt->dfa_uploaded &&
+//     ctx->fmap && ctx->fmap->len >= 256 * 1024) {
+//             fprintf(stderr, "=== CALLING GPU_SCAN ===\n");
+
+
+if (generic_ac_root && generic_ac_root->gpu_enabled &&
+    ctx->engine->gpu_rt && 
+    ctx->engine->gpu_rt->dfa_uploaded &&
+    ctx->fmap && ctx->fmap->len >= 256 * 1024) {
+            fprintf(stderr, "=== CALLING GPU_SCAN ===\n");
+
+     
+    
         const unsigned char *full_buf = fmap_need_off_once(ctx->fmap, 0, ctx->fmap->len);
         if (full_buf) {
             const char *gpu_virname = NULL;
          int gpu_rc = gpu_scan(ctx->engine->gpu_rt, full_buf,
                       (uint32_t)ctx->fmap->len,
                       &gpu_virname,
-                      generic_ac_root->maxpatlen,
+                        generic_ac_root->maxpatlen, //CHANGE THIS
+                        // ctx->engine->root[1]->maxpatlen,
                       ctx,
                       &info); 
-            if (gpu_rc == GPU_RESULT_VIRUS && gpu_virname) {
+            if (gpu_rc == GPU_RESULT_VIRUS) {
+                fprintf(stderr, "Attempting to append virus: '%s'\n", gpu_virname);
                 ret = cli_append_virus(ctx, gpu_virname);
-                if (ret != CL_SUCCESS) goto done;
+                fprintf(stderr, "cli_append_virus returned: %d\n", ret);
+               if (ret < 0) {  /* Only negative values are errors */
+                    fprintf(stderr, "Failed to append virus, error: %d\n", ret);
+                    goto done;
+                }
                 ctx->gpu_ac_done = true;
                 ret = CL_VIRUS; 
                 goto done;
@@ -1374,14 +1410,15 @@ cl_error_t cli_scan_fmap(cli_ctx *ctx, cli_file_t ftype, bool filetype_only, str
             }
             else if (gpu_rc == GPU_RESULT_BREAK) {
                     goto cpu_scan;
-}
+            
+                }
             
         }
     }
 #endif
 
 cpu_scan:
-
+    fprintf(stderr, "CPU_FALLBACK: Starting CPU scan for file\n");
     cli_dbgmsg("CLI_SCAN_FMAP: Starting main scan loop, fmap->len=%zu\n", ctx->fmap->len);
     while (offset < ctx->fmap->len) {
         if (cli_checktimelimit(ctx) != CL_SUCCESS) {
@@ -1399,10 +1436,10 @@ cpu_scan:
         if (target_ac_root) {
             const char *virname = NULL;
 
-            bytes = MIN(ctx->fmap->len - offset, SCANBUFF);
-             cli_dbgmsg("CLI_SCAN_FMAP: target_ac_root exists, calling matcher_run\n");
-            if (!(buff = fmap_need_off_once(ctx->fmap, offset, bytes)))
-                break;
+            // bytes = MIN(ctx->fmap->len - offset, SCANBUFF);
+            //  cli_dbgmsg("CLI_SCAN_FMAP: target_ac_root exists, calling matcher_run\n");
+            // if (!(buff = fmap_need_off_once(ctx->fmap, offset, bytes)))
+            //     break;
  
        
             
