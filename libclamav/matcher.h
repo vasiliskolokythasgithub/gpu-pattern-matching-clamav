@@ -120,7 +120,6 @@ struct cli_ac_lsig {
     uint32_t id;
     unsigned bc_idx;
     lsig_type_t type;
-    uint8_t has_regex; 
     uint8_t flag;
     union {
         char *logic;
@@ -128,6 +127,7 @@ struct cli_ac_lsig {
     } u;
     char *virname;
     struct cli_lsig_tdb tdb;
+    uint8_t has_regex; 
 };
 
 typedef void *fuzzyhashmap_t;
@@ -155,7 +155,7 @@ struct cli_matcher {
     uint32_t *gpu_dfa_next;
     uint16_t *gpu_dfa_out_count;
     uint32_t *gpu_dfa_out_index;
-    uint32_t *gpu_dfa_out_pat;
+    uint16_t *gpu_dfa_out_pat;
     uint32_t  gpu_dfa_states;
     uint32_t  gpu_patt_count;
     int       gpu_enabled;

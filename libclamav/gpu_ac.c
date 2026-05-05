@@ -30,7 +30,98 @@ typedef struct {
 
 
 
- 
+static int parse_subexpr_with_modifiers(const char *start, const char *end,
+                                        gpu_expr_inst_t *bytecode, int max_nodes,
+                                        int *pc, int uses_zero_based)
+{
+    /* This will parse something like "0>5" or "(0|1)>5,2" */
+    const char *p = start;
+    int modifier = 0;  /* 0=none, 1=>, 2=<, 3== */
+    int modval1 = 0, modval2 = 0;
+    int subexpr_pc_start = *pc;
+    
+    /* Skip whitespace if any */
+    while (p < end && isspace(*p)) p++;
+    
+    /* Find where the modifier starts (>, <, =) */
+    const char *mod_start = NULL;
+    const char *mod_end = NULL;
+    const char *comma_pos = NULL;
+    
+    for (const char *q = p; q < end; q++) {
+        if (*q == '>' || *q == '<' || *q == '=') {
+            mod_start = q;
+            break;
+        }
+    }
+    
+    /* If we found a modifier, parse the subexpression before it */
+    if (mod_start) {
+        /* Parse the left part (the actual expression) */
+        int left_len = mod_start - p;
+        char *left_expr = cli_malloc(left_len + 1);
+        if (!left_expr) return -1;
+        strncpy(left_expr, p, left_len);
+        left_expr[left_len] = '\0';
+        
+        /* Recursively parse the left expression */
+        int ret = build_lsig_bytecode_internal(left_expr, bytecode, max_nodes, 
+                                                pc, uses_zero_based);
+        free(left_expr);
+        if (ret < 0) return -1;
+        
+        /* Now parse the modifier */
+        const char *mod_str = mod_start;
+        if (*mod_str == '>') modifier = 1;
+        else if (*mod_str == '<') modifier = 2;
+        else if (*mod_str == '=') modifier = 3;
+        
+        mod_str++;
+        
+        /* Parse the number(s) after modifier */
+        char *endptr;
+        modval1 = strtoul(mod_str, &endptr, 10);
+        
+        /* Check for comma and second value */
+        if (*endptr == ',') {
+            modval2 = strtoul(endptr + 1, &endptr, 10);
+        }
+        
+        /* Generate the appropriate opcode */
+        if (modifier == 1) { /* > */
+            bytecode[*pc].op = 7;  /* OP_GT */
+            bytecode[*pc].operand = modval1;
+            (*pc)++;
+            
+            if (modval2 > 0) {
+                /* For A>X,Y, we need to check both count > X and distinct subsigs >= Y */
+                /* This is complex - we'll need to duplicate the result and check mask */
+                /* For now, we'll just do a simple implementation */
+            }
+        } else if (modifier == 2) { /* < */
+            bytecode[*pc].op = 8;  /* OP_LT */
+            bytecode[*pc].operand = modval1;
+            (*pc)++;
+        } else if (modifier == 3) { /* = */
+            bytecode[*pc].op = 9;  /* OP_EQ */
+            bytecode[*pc].operand = modval1;
+            (*pc)++;
+        }
+        
+        return 1;
+    }
+    
+    /* No modifier found, just parse as normal expression */
+    char *subexpr = cli_malloc(end - start + 1);
+    if (!subexpr) return -1;
+    strncpy(subexpr, start, end - start);
+    subexpr[end - start] = '\0';
+    
+    int ret = build_lsig_bytecode_internal(subexpr, bytecode, max_nodes, 
+                                            pc, uses_zero_based);
+    free(subexpr);
+    return ret;
+}
 
 
 int build_lsig_bytecode_internal(const char *expr, 
@@ -193,49 +284,105 @@ int build_lsig_bytecode_internal(const char *expr,
     return 0;
 }
 
- int build_lsig_bytecode(const char *expr, 
-                                gpu_expr_inst_t *bytecode,
-                                int max_nodes,
+/* Helper function to build bytecode from logical expression */
+static int build_lsig_bytecode(const char *logic, 
+                                gpu_expr_inst_t *bytecode, 
+                                uint32_t max_nodes,
                                 int *uses_zero_based)
 {
-    int pc = 0;
+    uint32_t pos = 0;
+    uint32_t stack[32];
+    uint32_t sp = 0;
     
-    /* First pass: detect if expression uses 0-based indices */
-    *uses_zero_based = 0;
-    const char *p = expr;
-    while (*p) {
-        if (isdigit(*p)) {
-            int subsig = 0;
-            while (isdigit(*p)) {
-                subsig = subsig * 10 + (*p - '0');
-                p++;
+    if (!logic || !bytecode) return -1;
+    
+    /* For simple expressions like "0&1&2" or "0|1|2" */
+    const char *ptr = logic;
+    uint32_t first_op = 0;
+    char op_type = 0;
+    
+    /* Parse the first operand */
+    while (*ptr && (*ptr < '0' || *ptr > '9')) ptr++;
+    if (!*ptr) return -1;
+    
+    first_op = atoi(ptr);
+    *uses_zero_based = (first_op == 0); /* Detect if using 0-based indexing */
+    
+    /* Find the operator */
+    while (*ptr && *ptr != '&' && *ptr != '|') ptr++;
+    if (*ptr) {
+        op_type = *ptr;
+    }
+    
+    if (op_type == 0) {
+        /* Single operand - just LOAD it */
+        if (pos >= max_nodes) return -1;
+        bytecode[pos].op = 0; /* LOAD */
+        bytecode[pos].operand = first_op;
+        pos++;
+    } else {
+        /* Multiple operands with same operator */
+        uint32_t operands[32];
+        uint32_t num_ops = 0;
+        
+        /* Collect all operands */
+        ptr = logic;
+        while (*ptr) {
+            while (*ptr && (*ptr < '0' || *ptr > '9')) ptr++;
+            if (*ptr) {
+                operands[num_ops++] = atoi(ptr);
+                while (*ptr && (*ptr >= '0' && *ptr <= '9')) ptr++;
             }
-            if (subsig == 0) {
-                *uses_zero_based = 1;
-                break;
+        }
+        
+        /* Generate LOADs */
+        for (uint32_t i = 0; i < num_ops; i++) {
+            if (pos >= max_nodes) return -1;
+            bytecode[pos].op = 0; /* LOAD */
+            bytecode[pos].operand = operands[i];
+            pos++;
+        }
+        
+        /* Generate operators */
+        for (uint32_t i = 1; i < num_ops; i++) {
+            if (pos >= max_nodes) return -1;
+            if (op_type == '&') {
+                bytecode[pos].op = 1; /* AND */
+            } else if (op_type == '|') {
+                bytecode[pos].op = 2; /* OR */
             }
-        } else {
-            p++;
+            bytecode[pos].operand = 0;
+            pos++;
         }
     }
     
-    /* Parse the expression recursively */
-    int ret = build_lsig_bytecode_internal(expr, bytecode, max_nodes, &pc, *uses_zero_based);
-    if (ret < 0) return ret;
+    /* Add END opcode */
+    if (pos >= max_nodes) return -1;
+    bytecode[pos].op = 4; /* END */
+    bytecode[pos].operand = 0;
+    pos++;
     
-    /* Add END instruction */
-    if (pc < max_nodes - 1) {
-        bytecode[pc].op = 4;  /* END */
-        bytecode[pc].operand = 0;
-        pc++;
-    }
-    
-    return pc;
+    return pos;
 }
 
 
 
-
+static int get_expr_type(const char *expr)
+{
+    int has_paren = 0;
+    int has_and = 0;
+    int has_or = 0;
+    
+    for (int i = 0; expr[i]; i++) {
+        if (expr[i] == '(') has_paren = 1;
+        if (expr[i] == '&') has_and = 1;
+        if (expr[i] == '|') has_or = 1;
+    }
+    
+    if (!has_paren && has_and && !has_or) return 1;  /* Simple AND */
+    if (!has_paren && !has_and && has_or) return 2;  /* Simple OR */
+    return 3;  /* Complex (nested or mixed) */
+}
  
 
 /**
@@ -243,44 +390,13 @@ int build_lsig_bytecode_internal(const char *expr,
  * Call this after gpu_upload_pattern_metadata
  */
 
- int gpu_upload_logical_signatures(struct gpu_rt *rt, struct cli_matcher *root, uint32_t matcher_idx)
+ int gpu_upload_logical_signatures(struct gpu_rt *rt,
+                                   struct cli_matcher *root)
 {
-    struct gpu_matcher_data *m = &rt->matchers[matcher_idx];
     cl_int err;
 
-    if (!rt || !root) {
-        fprintf(stderr, "  GPU LSIG: rt or root is NULL\n");
-        return -1;
-    }
-    
-    fprintf(stderr, "  GPU LSIG: root->ac_lsigtable=%p, ac_lsigs=%u (matcher %u)\n", 
-            (void*)root->ac_lsigtable, root->ac_lsigs, matcher_idx);
-    fflush(stderr);
-    
-    if (!rt || !root || !root->ac_lsigtable) {
-        fprintf(stderr, "  GPU LSIG: No logical signatures (null)\n");
-        m->num_lsigs = 0;
-        return 0;
-    }
-    
-    fprintf(stderr, "  GPU LSIG: Counting logical signatures...\n");
-    fflush(stderr);
-    
-    /* Count logical signatures */
-    uint32_t num_lsigs = 0;
-    while (num_lsigs < root->ac_lsigs && 
-           root->ac_lsigtable[num_lsigs] != NULL) {
-        num_lsigs++;
-        if (num_lsigs % 1000 == 0) {
-            // fprintf(stderr, "    Counted %u logical signatures\n", num_lsigs);
-            fflush(stderr);
-        }
-    }
-    
-    fprintf(stderr, "  GPU LSIG: Found %u logical signatures\n", num_lsigs);
-    fflush(stderr);
 
-    fprintf(stderr, "=== GPU LSIG UPLOAD (matcher %u) ===\n", matcher_idx);
+       fprintf(stderr, "=== GPU LSIG UPLOAD ===\n");
     fprintf(stderr, "root=%p\n", (void*)root);
     
     if (!rt || !root) {
@@ -293,12 +409,12 @@ int build_lsig_bytecode_internal(const char *expr,
     
     if (!rt || !root || !root->ac_lsigtable) {
         fprintf(stderr, "GPU LSIG: No logical signatures (null)\n");
-        m->num_lsigs = 0;
+        rt->num_lsigs = 0;
         return 0;
     }
     
-    /* Count logical signatures */ 
-    num_lsigs = 0;
+    /* Count logical signatures */
+    uint32_t num_lsigs = 0;
     while (num_lsigs < root->ac_lsigs && 
            root->ac_lsigtable[num_lsigs] != NULL) {
         num_lsigs++;
@@ -308,7 +424,7 @@ int build_lsig_bytecode_internal(const char *expr,
             num_lsigs, root->ac_lsigs);
     
     if (num_lsigs == 0) {
-        m->num_lsigs = 0;
+        rt->num_lsigs = 0;
         return 0;
     }
     
@@ -331,68 +447,25 @@ int build_lsig_bytecode_internal(const char *expr,
         if (!lsig) continue;
         
         gpu_lsig_meta_t *meta = &h_metas[i];
-        if (lsig->tdb.subsigs == 1 && 
-            !lsig->tdb.container && 
-            !lsig->tdb.filesize && 
-            !lsig->tdb.ep &&
-            !lsig->tdb.nos) {
-            meta->expr_length = 0;
-            continue;
-        }
         
         meta->sig_id = i + 1;  
         meta->num_subsigs = lsig->tdb.subsigs;
-
-        /* Debug for problematic signatures */
-        if (lsig->virname && strstr(lsig->virname, "Mediaget")) {
-            fprintf(stderr, "FIXED: LSIG[%u] %s: tdb.subsigs=%u, actual_subsigs=%u\n",
-                    i, lsig->virname, lsig->tdb.subsigs, meta->num_subsigs);
-        }
         meta->expr_offset = current_pos;
         
-        if (lsig->virname && strstr(lsig->virname, "ZxShell-10")) {
-            fprintf(stderr, "ZxShell LSIG[%u]: sig_id=%u, subsigs=%u, expr='%s'\n",
-                    i, i+1, lsig->tdb.subsigs, lsig->u.logic ? lsig->u.logic : "NULL");
-                    fprintf(stderr, "  nos=[%u,%u], handlertype=%u\n",
-        lsig->tdb.nos ? lsig->tdb.nos[0] : 0,
-        lsig->tdb.nos ? lsig->tdb.nos[1] : 0,
-        lsig->tdb.handlertype ? lsig->tdb.handlertype[0] : 0);
-            fprintf(stderr, "  container=%u, filesize=[%u,%u], ep=[%u,%u], nos=[%u,%u]\n",
-                    lsig->tdb.container ? lsig->tdb.container[0] : 0,
-                    lsig->tdb.filesize ? lsig->tdb.filesize[0] : 0,
-                    lsig->tdb.filesize ? lsig->tdb.filesize[1] : 0,
-                    lsig->tdb.ep ? lsig->tdb.ep[0] : 0,
-                    lsig->tdb.ep ? lsig->tdb.ep[1] : 0,
-                    lsig->tdb.nos ? lsig->tdb.nos[0] : 0,
-                    lsig->tdb.nos ? lsig->tdb.nos[1] : 0);
-            // Print subsig patterns
-            for (uint32_t s = 0; s < root->ac_patterns; s++) {
-                struct cli_ac_patt *p = root->ac_pattable[s];
-                if (p && p->lsigid[0] && p->lsigid[1] == i+1) {
-                    fprintf(stderr, "  subsig[%u]: len=%u, depth=%u, pattern: ",
-                            p->lsigid[2], p->length[0], p->depth);
-                    for (int j = 0; j < p->length[0] && j < 8; j++)
-                        fprintf(stderr, "%04x ", p->pattern[j]);
-                    fprintf(stderr, "\n");
-                }
-            }
-        }
-
         /* Handle virus name */
         if (lsig->virname) {
-            meta->virname_offset = m->virname_pool_size;
+            meta->virname_offset = rt->virname_pool_size;
             meta->virname_len = strlen(lsig->virname);
             
-            char *new_pool = realloc(m->h_virname_pool, m->virname_pool_size + meta->virname_len + 1);
-            if (!new_pool) {
-                free(h_metas);
-                free(h_bytecode);
-                return -1;
-            }
-            m->h_virname_pool = new_pool;
+            // fprintf(stderr, "LSIG[%u]: virname='%s', subsigs=%u, bc_idx=%u\n", 
+            //         i, lsig->virname, lsig->tdb.subsigs, lsig->bc_idx);
             
-            strcpy(m->h_virname_pool + m->virname_pool_size, lsig->virname);
-            m->virname_pool_size += meta->virname_len + 1;
+            char *new_pool = realloc(rt->h_virname_pool, rt->virname_pool_size + meta->virname_len + 1);
+            if (!new_pool) return -1;
+            rt->h_virname_pool = new_pool;
+            
+            strcpy(rt->h_virname_pool + rt->virname_pool_size, lsig->virname);
+            rt->virname_pool_size += meta->virname_len + 1;
         } else {
             meta->virname_offset = 0;
             meta->virname_len = 0;
@@ -423,7 +496,10 @@ int build_lsig_bytecode_internal(const char *expr,
         meta->tdb_icongrp1_offset = 0;
         meta->tdb_icongrp2_offset = 0;
 
-        meta->has_regex = lsig->has_regex;
+           meta->has_regex = lsig->has_regex;
+        // if (meta->has_regex) {
+        //     fprintf(stderr, "LSIG[%u]: has regex in subsigs\n", i);
+        // }
                     
         /* Generate bytecode */
         uint32_t start_pos = current_pos;
@@ -436,6 +512,8 @@ int build_lsig_bytecode_internal(const char *expr,
                 current_pos += bytecode_len;
                 meta->expr_length = bytecode_len;
                 bytecode_generated = 1;
+                // fprintf(stderr, "LSIG[%u]: compiled expr '%s' -> %d nodes (uses_zero_based=%d)\n", 
+                //         i, lsig->u.logic, bytecode_len, uses_zero_based);
             }
         }
 
@@ -469,51 +547,65 @@ int build_lsig_bytecode_internal(const char *expr,
         }
     }
     
+    
     /* Upload to GPU */
-    m->d_lsig_metas = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+    rt->d_lsig_metas = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                        num_lsigs * sizeof(gpu_lsig_meta_t),
                                        h_metas, &err);
     if (err != CL_SUCCESS) goto error;
     
-    m->d_expr_bytecode = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+    rt->d_expr_bytecode = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                           current_pos * sizeof(gpu_expr_inst_t),
                                           h_bytecode, &err);
     if (err != CL_SUCCESS) goto error;
     
-    m->num_lsigs = num_lsigs;
-    m->expr_bytecode_size = current_pos;
+    rt->num_lsigs = num_lsigs;
+    rt->expr_bytecode_size = current_pos;
     
-    fprintf(stderr, "GPU LSIG: Uploaded %u signatures, %u expr nodes for matcher %u\n",
-            num_lsigs, current_pos, matcher_idx);
+    fprintf(stderr, "GPU LSIG: Uploaded %u signatures, %u expr nodes\n",
+            num_lsigs, current_pos);
     
-    fprintf(stderr, "=== LOGICAL SIGNATURES IN ROOT (matcher %u) ===\n", matcher_idx);
-    for (uint32_t i = 0; i < root->ac_lsigs; i++) {
-        struct cli_ac_lsig *lsig = root->ac_lsigtable[i];
-        // if (lsig) {
-        //     fprintf(stderr, "  LSIG[%u]: sig_id should be %u, virname='%s', subsigs=%u\n",
-        //             i, i+1, lsig->virname ? lsig->virname : "NULL", lsig->tdb.subsigs);
-        // }
-    }
+
+            fprintf(stderr, "=== LOGICAL SIGNATURES IN ROOT ===\n");
+for (uint32_t i = 0; i < root->ac_lsigs; i++) {
+    struct cli_ac_lsig *lsig = root->ac_lsigtable[i];
+    // if (lsig) {
+    //     fprintf(stderr, "  LSIG[%u]: sig_id should be %u, virname='%s', subsigs=%u\n",
+    //             i, i+1, lsig->virname ? lsig->virname : "NULL", lsig->tdb.subsigs);
+    // }
+}
     free(h_metas);
     free(h_bytecode);
     return 0;
     
 error:
-    cli_errmsg("GPU: Failed to upload logical signatures for matcher %u: %d\n", matcher_idx, err);
+    cli_errmsg("GPU: Failed to upload logical signatures: %d\n", err);
     free(h_metas);
     free(h_bytecode);
     return -1;
 }
 
-
-int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uint32_t matcher_idx)
+int gpu_upload_pattern_metadata(struct gpu_rt *rt,
+                                 struct cli_matcher *root)
 {
-    struct gpu_matcher_data *m = &rt->matchers[matcher_idx];
-    
-    fprintf(stderr, "=== gpu_upload_pattern_metadata START (matcher %u) ===\n", matcher_idx);
+        fprintf(stderr, "=== gpu_upload_pattern_metadata START ===\n");
     fprintf(stderr, "rt=%p, root=%p\n", (void*)rt, (void*)root);
     fprintf(stderr, "root->gpu_patt_count=%u\n", root->gpu_patt_count);
     fprintf(stderr, "root->ac_patterns=%u\n", root->ac_patterns);
+    fprintf(stderr, "root->gpu_patt_lookup=%p\n", (void*)root->gpu_patt_lookup);
+    fprintf(stderr, "gpu_upload_pattern_metadata: Starting...\n");
+    fprintf(stderr, "  root=%p, rt=%p, gpu_patt_count=%u\n", 
+            (void*)root, (void*)rt, root->gpu_patt_count);
+
+    /* DEBUG: Print all pattern virnames from the matcher */
+    // for (uint32_t i = 0; i < root->ac_patterns; i++) {
+    //     if (root->ac_pattable[i] && root->ac_pattable[i]->virname) {
+    //         fprintf(stderr, "  CPU PATTERN[%u]: virname='%s', sigid=%u, lsigid[0]=%u\n",
+    //                 i, root->ac_pattable[i]->virname, 
+    //                 root->ac_pattable[i]->sigid,
+    //                 root->ac_pattable[i]->lsigid[0]);
+    //     }
+    // }
     
     cl_int err;
     uint32_t np = root->gpu_patt_count;
@@ -523,27 +615,12 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
         return -1;
     }
     
-    /* Pass 1: Calculate total sizes and debug logical patterns */
+    /* Pass 1: Calculate total sizes */
     uint32_t total_pat_bytes = 0;
     uint32_t total_pfx_bytes = 0;
     uint32_t total_vn_bytes = 0;
-    uint32_t logical_pattern_count = 0;
     
     fprintf(stderr, "  Calculating sizes for %u patterns...\n", np);
-    
-    /* Build a mapping from logical signature ID to subsig count */
-    uint32_t *lsig_subsig_counts = NULL;
-    if (root->ac_lsigs > 0 && root->ac_lsigtable) {
-        lsig_subsig_counts = calloc(root->ac_lsigs, sizeof(uint32_t));
-        if (lsig_subsig_counts) {
-            for (uint32_t i = 0; i < root->ac_lsigs; i++) {
-                if (root->ac_lsigtable[i]) {
-                    lsig_subsig_counts[i] = root->ac_lsigtable[i]->tdb.subsigs;
-                    //fprintf(stderr, "  LSIG[%u]: has %u subsignatures\n", i, lsig_subsig_counts[i]);
-                }
-            }
-        }
-    }
     
     for (uint32_t i = 0; i < np; i++) {
         struct cli_ac_patt *p = root->gpu_patt_lookup[i];
@@ -551,71 +628,39 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
             fprintf(stderr, "  WARNING: gpu_patt_lookup[%u] is NULL\n", i);
             continue;
         }
-        if (i != p->gpu_id) {
-        fprintf(stderr, "WARNING: Pattern index mismatch: i=%u, gpu_id=%u\n", i, p->gpu_id);
-        }
-            
-        
-        if (p->lsigid[0] && p->lsigid[1] > root->ac_lsigs) {
-            fprintf(stderr, "ERROR: pattern %u has lsigid[1]=%u > num_lsigs=%u\n",
-                    i, p->lsigid[1], root->ac_lsigs);
-            
-        }
-        
-        /* Check pattern bytes pointer */
-        if (!p->pattern && p->length[0] > 0) {
-            fprintf(stderr, "ERROR: pattern %u has NULL pattern bytes (len=%u)\n", 
-                    i, p->length[0]);
-           
-        }
         total_pat_bytes += p->length[0];
         total_pfx_bytes += p->prefix_length[0];
         if (p->virname)
             total_vn_bytes += strlen(p->virname) + 1;
-        
-        /* Debug logical patterns and fix partno/parts if needed */
-        if (p->lsigid[0] > 0) {
-            logical_pattern_count++;
-            uint32_t lsig_idx = p->lsigid[1] - 1;  /* Convert to 0-based */
-            uint32_t subsig = p->lsigid[2];
-            
 
-                if (p->lsigid[1] == 0) {
-        fprintf(stderr, "  WARNING: lsigid[1]=0 for pattern %u - skipping fix\n", i);
-        continue;  // or just skip the fix block
-    }
-
-            /* CRITICAL: If partno/parts are 0, try to fix them from lsig table */
-            if ((p->partno == 0 || p->parts == 0) && lsig_subsig_counts && lsig_idx < root->ac_lsigs) {
-                uint32_t total_subsigs = lsig_subsig_counts[lsig_idx];
-                if (total_subsigs > 0) {
-                    p->partno = subsig + 1;  /* 1-based part number */
-                    p->parts = total_subsigs;
-                }
-            }
-            
-            /* Also warn if still zero */
-            if (p->partno == 0 || p->parts == 0) {
-                fprintf(stderr, "  WARNING: Logical pattern has partno=%u, parts=%u - this will break GPU detection!\n",
-                        p->partno, p->parts);
-            }
-        }
+        if (p->virname && strstr(p->virname, "Email.Phishing.VOF1-6295567-1")) {
+    fprintf(stderr, "FOUND PROBLEM PATTERN: pattern %u, lsig_id=%u, subsig=%u, has_regex=%d\n",
+            i, p->lsigid[1], p->lsigid[2], p->has_regex);
+}
         
-        if (i < 5) {
-            fprintf(stderr, "    pattern[%u]: len=%u, pfx_len=%u, virname=%s, lsigid[0]=%u\n", 
+        if (i < 5) {  /* Print first few for debugging */
+            fprintf(stderr, "    pattern[%u]: len=%u, pfx_len=%u, virname=%s\n", 
                     i, p->length[0], p->prefix_length[0], 
-                    p->virname ? p->virname : "NULL", p->lsigid[0]);
+                    p->virname ? p->virname : "NULL");
         }
     }
     
     fprintf(stderr, "  total_pat_bytes=%u, total_pfx_bytes=%u, total_vn_bytes=%u\n",
             total_pat_bytes, total_pfx_bytes, total_vn_bytes);
-    fprintf(stderr, "  logical_pattern_count=%u\n", logical_pattern_count);
     
     /* Ensure minimums for buffer creation */
-    if (total_pat_bytes == 0) total_pat_bytes = 1;
-    if (total_pfx_bytes == 0) total_pfx_bytes = 1;
-    if (total_vn_bytes == 0) total_vn_bytes = 1;
+    if (total_pat_bytes == 0) {
+        fprintf(stderr, "  WARNING: total_pat_bytes is 0, setting to 1\n");
+        total_pat_bytes = 1;
+    }
+    if (total_pfx_bytes == 0) {
+        fprintf(stderr, "  WARNING: total_pfx_bytes is 0, setting to 1\n");
+        total_pfx_bytes = 1;
+    }
+    if (total_vn_bytes == 0) {
+        fprintf(stderr, "  WARNING: total_vn_bytes is 0, setting to 1\n");
+        total_vn_bytes = 1;
+    }
     
     /* Allocate host arrays */
     fprintf(stderr, "  Allocating host arrays...\n");
@@ -625,24 +670,34 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
     uint16_t *h_pfx_bytes = malloc(total_pfx_bytes * sizeof(uint16_t));
     char *h_vn_pool = malloc(total_vn_bytes);
     
+    fprintf(stderr, "    h_patterns=%p, h_pat_bytes=%p, h_pfx_bytes=%p, h_vn_pool=%p\n",
+            (void*)h_patterns, (void*)h_pat_bytes, (void*)h_pfx_bytes, (void*)h_vn_pool);
+    
     if (!h_patterns || !h_pat_bytes || !h_pfx_bytes || !h_vn_pool) {
         fprintf(stderr, "  ERROR: Failed to allocate host arrays\n");
-        goto fail_free_arrays;
+        free(h_patterns); free(h_pat_bytes);
+        free(h_pfx_bytes); free(h_vn_pool);
+        return -1;
     }
     
     /* Pass 2: Fill arrays */
     fprintf(stderr, "  Filling host arrays...\n");
     
     uint32_t pat_off = 0, pfx_off = 0, vn_off = 0;
-    uint32_t max_depth = root->ac_maxdepth;
     
     for (uint32_t i = 0; i < np; i++) {
         struct cli_ac_patt *p = root->gpu_patt_lookup[i];
         if (!p) continue;
         
         gpu_pattern_t *gp = &h_patterns[i];
+        uint16_t max_depth = root->ac_maxdepth;
+ 
+        // if (gp->has_regex) {
+        //     fprintf(stderr, "GPU UPLOAD: Pattern[%u] has regex flag set, lsig_id=%u, subsig=%u\n", 
+        //             i, p->lsigid[1], p->lsigid[2]);
+        // }
         
-        /* Copy all pattern fields */
+        gp->depth = (p->length[0] < max_depth) ? p->length[0] : max_depth;
         gp->length = p->length[0];
         gp->prefix_length = p->prefix_length[0];
         gp->parts = p->parts;
@@ -653,31 +708,29 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
         gp->offset_max = p->offset_max;
         gp->lsigid[0] = p->lsigid[0];
         gp->lsigid[1] = p->lsigid[1];
-        gp->lsigid[2] = p->lsigid[2];
-        gp->boundary = p->boundary;
-        gp->sigopts = p->sigopts;
+        gp->boundary = p->boundary;  /* Copy boundary flags from CPU pattern */
+        gp->sigopts = p->sigopts;    /* Copy signature options */
+        
+        /* Get number of subsigs from lsig table if this is a logical signature */
+        gp->has_regex = 0;  // Default
+
+            if (p->lsigid[0] > 0) {  // This pattern belongs to a logical signature
+                uint32_t lsig_idx = p->lsigid[1];  // Logical signature ID (1-based in lsigid[1])
+                if (lsig_idx > 0 && lsig_idx <= root->ac_lsigs) {
+                    struct cli_ac_lsig *lsig = root->ac_lsigtable[lsig_idx - 1];
+                    if (lsig) {
+                        gp->has_regex = lsig->has_regex;  // Copy from the logical signature
+                        if (gp->has_regex) {
+                            fprintf(stderr, "GPU UPLOAD: Pattern[%u] inherits regex flag from lsig %u\n", 
+                                    i, lsig_idx);
+                        }
+                    }
+                }
+            }
         gp->mindist = p->mindist;
         gp->maxdist = p->maxdist;
-        gp->has_regex = 0;
-        gp->special_pattern = p->special_pattern;
         
-        /* Depth calculation */
-        if (p->lsigid[0] > 0 && p->depth > 0) {
-            gp->depth = p->depth;
-        } else {
-            gp->depth = (p->length[0] < max_depth) ? p->length[0] : max_depth;
-        }
-        
-        /* Debug fixed logical patterns */
-        if (p->lsigid[0] > 0) {
-            /* Get logical signature metadata for regex flag */
-            uint32_t lsig_idx = p->lsigid[1] - 1;
-            if (lsig_idx < root->ac_lsigs && root->ac_lsigtable[lsig_idx]) {
-                gp->has_regex = root->ac_lsigtable[lsig_idx]->has_regex;
-            }
-        }
-        
-        /* Map offset types */
+        /* Map ClamAV offset types to GPU constants */
         if (p->offdata[0] == CLI_OFF_ANY || p->offdata[0] == 0) {
             gp->offdata0 = GPU_OFF_ANY;
         } else if (p->offdata[0] == CLI_OFF_NONE) {
@@ -688,7 +741,6 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
             gp->offdata0 = GPU_OFF_ANY;
         }
         
-        /* Copy character metadata */
         gp->ch0 = p->ch[0];
         gp->ch1 = p->ch[1];
         gp->ch_mindist0 = p->ch_mindist[0];
@@ -701,8 +753,9 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
         if (p->pattern) {
             for (uint16_t j = 0; j < p->length[0]; j++) {
                 if (pat_off >= total_pat_bytes) {
-                    fprintf(stderr, "  ERROR: pat_off overflow: %u >= %u\n", pat_off, total_pat_bytes);
-                    goto fail_free_arrays;
+                    fprintf(stderr, "  ERROR: pat_off overflow: %u >= %u\n", 
+                            pat_off, total_pat_bytes);
+                    goto fail;
                 }
                 h_pat_bytes[pat_off++] = p->pattern[j];
             }
@@ -713,8 +766,9 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
         if (p->prefix) {
             for (uint16_t j = 0; j < p->prefix_length[0]; j++) {
                 if (pfx_off >= total_pfx_bytes) {
-                    fprintf(stderr, "  ERROR: pfx_off overflow: %u >= %u\n", pfx_off, total_pfx_bytes);
-                    goto fail_free_arrays;
+                    fprintf(stderr, "  ERROR: pfx_off overflow: %u >= %u\n", 
+                            pfx_off, total_pfx_bytes);
+                    goto fail;
                 }
                 h_pfx_bytes[pfx_off++] = p->prefix[j];
             }
@@ -724,11 +778,16 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
         if (p->virname) {
             gp->virname_offset = vn_off;
             gp->virname_len = strlen(p->virname);
+
+            if (p->virname && strstr(p->virname, "TestSig")) {
+    fprintf(stderr, "*** UPLOADING TEST SIG: %s, pid=%u, sigid=%u, lsigid[0]=%u\n",
+            p->virname, i, p->sigid, p->lsigid[0]);
+}
             
             if (vn_off + gp->virname_len + 1 > total_vn_bytes) {
                 fprintf(stderr, "  ERROR: vn_off overflow: %u + %u > %u\n",
                         vn_off, gp->virname_len + 1, total_vn_bytes);
-                goto fail_free_arrays;
+                goto fail;
             }
             
             memcpy(h_vn_pool + vn_off, p->virname, gp->virname_len + 1);
@@ -737,86 +796,116 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt, struct cli_matcher *root, uin
             gp->virname_offset = 0;
             gp->virname_len = 0;
         }
+        
+        if (i < 5) {
+            fprintf(stderr, "    filled[%u]: depth=%u, len=%u, off=%u\n",
+                    i, gp->depth, gp->length, gp->pattern_offset);
+        }
+    }
+
+    fprintf(stderr, "GPU DEBUG: First 5 patterns:\n");
+    for (uint32_t i = 0; i < 5 && i < np; i++) {
+        struct cli_ac_patt *p = root->gpu_patt_lookup[i];
+        if (!p) continue;
+        gpu_pattern_t *gp = &h_patterns[i];
+        
+        fprintf(stderr, "  Pattern[%u]: sig_id=%u, virname=%s\n", 
+                i, p->sigid, p->virname ? p->virname : "NULL");
+        fprintf(stderr, "    depth=%u, length=%u, pattern_offset=%u\n",
+                gp->depth, gp->length, gp->pattern_offset);
+        fprintf(stderr, "    First 8 pattern bytes: ");
+        for (int j = 0; j < 8 && j < p->length[0]; j++) {
+            fprintf(stderr, "0x%04x ", p->pattern[j]);
+        }
+        fprintf(stderr, "\n");
     }
     
     fprintf(stderr, "  Final offsets: pat_off=%u/%u, pfx_off=%u/%u, vn_off=%u/%u\n",
             pat_off, total_pat_bytes, pfx_off, total_pfx_bytes, vn_off, total_vn_bytes);
     
-    /* Store sizes in matcher struct */
-    m->num_pattern_bytes = pat_off;
-    m->num_prefix_bytes = pfx_off;
-    m->num_patterns = np;
-    
-    /* Create GPU buffers */
+    /* Upload to GPU */
     fprintf(stderr, "  Creating GPU buffers...\n");
     
-    m->d_patterns = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+    rt->num_pattern_bytes = pat_off;
+    rt->num_prefix_bytes = pfx_off;
+    
+    rt->d_patterns = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                      np * sizeof(gpu_pattern_t), h_patterns, &err);
-    if (err != CL_SUCCESS) goto fail_free_arrays;
-    fprintf(stderr, "    d_patterns: created\n");
+    fprintf(stderr, "    d_patterns: err=%d\n", err);
+    if (err != CL_SUCCESS) goto fail;
     
-    m->d_pattern_bytes = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+    rt->d_pattern_bytes = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                           pat_off * sizeof(uint16_t), h_pat_bytes, &err);
-    if (err != CL_SUCCESS) goto fail_release_patterns;
-    fprintf(stderr, "    d_pattern_bytes: created\n");
+    fprintf(stderr, "    d_pattern_bytes: err=%d\n", err);
+    if (err != CL_SUCCESS) goto fail;
     
-    m->d_prefix_bytes = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+    rt->d_prefix_bytes = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                          pfx_off * sizeof(uint16_t), h_pfx_bytes, &err);
-    if (err != CL_SUCCESS) goto fail_release_pattern_bytes;
-    fprintf(stderr, "    d_prefix_bytes: created\n");
+    fprintf(stderr, "    d_prefix_bytes: err=%d\n", err);
+    if (err != CL_SUCCESS) goto fail;
     
-    /* Create virname pool */
-    fprintf(stderr, "  Creating virname pool of size %u\n", vn_off);
-    m->h_virname_pool = malloc(vn_off);
-    if (!m->h_virname_pool) {
-        fprintf(stderr, "  ERROR: Failed to allocate host virname pool\n");
-        goto fail_release_prefix_bytes;
-    }
-    memcpy(m->h_virname_pool, h_vn_pool, vn_off);
-    m->virname_pool_size = vn_off;
+  
+    fprintf(stderr, "    d_virname_pool: err=%d\n", err);
+    if (err != CL_SUCCESS) goto fail;
     
-    m->d_virname_pool = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                         m->virname_pool_size, m->h_virname_pool, &err);
+    /* Tracker pool (read-write, zeroed) */
+    rt->d_tracker_pool = clCreateBuffer(rt->context, CL_MEM_READ_WRITE,
+                                         GPU_MAX_TRACKERS * sizeof(gpu_multipart_tracker_t),
+                                         NULL, &err);
+    fprintf(stderr, "    d_tracker_pool: err=%d\n", err);
     if (err != CL_SUCCESS) {
-        fprintf(stderr, "    d_virname_pool: err=%d\n", err);
-        goto fail_free_host_pool;
+        printf("Failed to create tracker pool: %d\n", err);
+        goto fail;
     }
-    fprintf(stderr, "    d_virname_pool: created\n");
     
-    /* Cleanup */
+    rt->d_tracker_count = clCreateBuffer(rt->context, CL_MEM_READ_WRITE,
+                                          sizeof(uint32_t), NULL, &err);
+    fprintf(stderr, "    d_tracker_count: err=%d\n", err);
+    if (err != CL_SUCCESS) goto fail;
+    
+    /* Result buffer */
+    rt->d_result = clCreateBuffer(rt->context, CL_MEM_READ_WRITE,
+                                   sizeof(gpu_scan_result_t), NULL, &err);
+    fprintf(stderr, "    d_result: err=%d\n", err);
+    if (err != CL_SUCCESS) goto fail;
+    
+    /* Keep host copy of virname pool */
+    fprintf(stderr, "  Allocating host virname pool of size %u\n", vn_off);
+    rt->h_virname_pool = malloc(vn_off);
+    if (!rt->h_virname_pool) {
+        fprintf(stderr, "  ERROR: Failed to allocate host virname pool\n");
+        goto fail;
+    }
+    memcpy(rt->h_virname_pool, h_vn_pool, vn_off);
+    rt->virname_pool_size = vn_off;
+    rt->num_gpu_patterns = np;
+
+
+
+     rt->d_virname_pool = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     rt->virname_pool_size, rt->h_virname_pool, &err);
+    
+    fprintf(stderr, "  Cleaning up host arrays...\n");
     free(h_patterns);
     free(h_pat_bytes);
     free(h_pfx_bytes);
     free(h_vn_pool);
-    if (lsig_subsig_counts) free(lsig_subsig_counts);
     
-    fprintf(stderr, "gpu_upload_pattern_metadata: SUCCESS - %u patterns uploaded for matcher %u\n", np, matcher_idx);
+    rt->v2_uploaded = 1;
+    fprintf(stderr, "gpu_upload_pattern_metadata: SUCCESS\n");
     return 0;
     
-/* Error handling */
-fail_release_prefix_bytes:
-    clReleaseMemObject(m->d_prefix_bytes);
-    m->d_prefix_bytes = NULL;
-fail_release_pattern_bytes:
-    clReleaseMemObject(m->d_pattern_bytes);
-    m->d_pattern_bytes = NULL;
-fail_release_patterns:
-    clReleaseMemObject(m->d_patterns);
-    m->d_patterns = NULL;
-fail_free_host_pool:
-    free(m->h_virname_pool);
-    m->h_virname_pool = NULL;
-fail_free_arrays:
-    if (h_patterns) free(h_patterns);
-    if (h_pat_bytes) free(h_pat_bytes);
-    if (h_pfx_bytes) free(h_pfx_bytes);
-    if (h_vn_pool) free(h_vn_pool);
-    if (lsig_subsig_counts) free(lsig_subsig_counts);
-    fprintf(stderr, "gpu_upload_pattern_metadata: FAILED for matcher %u\n", matcher_idx);
+fail:
+    fprintf(stderr, "gpu_upload_pattern_metadata: FAILED at step above (err=%d)\n", err);
+    free(h_patterns);
+    free(h_pat_bytes);
+    free(h_pfx_bytes);
+    free(h_vn_pool);
     return -1;
 }
  
 
+ 
 int gpu_scan(struct gpu_rt *rt,
              const unsigned char *file_buffer,
              uint32_t file_length,
@@ -831,16 +920,7 @@ int gpu_scan(struct gpu_rt *rt,
     uint32_t entry_point = 0;
     uint32_t is_pe_target = 0;
     
-    /* Get the selected matcher data */
-    //CHANGE THIS
-    struct gpu_matcher_data *m = &rt->matchers[0];
-
-    if (!rt || !m->uploaded) {
-        
-        return GPU_RESULT_BREAK;
-    }
-        
-    /* Get TDB information from context */
+    /* Get TDB information from context (like you do for logical kernel) */
     if (tinfo && tinfo->status == 1) {
         entry_point = tinfo->exeinfo.ep;
         is_pe_target = 1;
@@ -850,6 +930,11 @@ int gpu_scan(struct gpu_rt *rt,
         container_type = cli_recursion_stack_get_type(ctx, -1);
     }
     
+
+
+    if (!rt || !rt->dfa_uploaded || !rt->v2_uploaded) {
+        return GPU_RESULT_BREAK;
+    }
 
     if (file_length > rt->scan_buffer_size) {
         fprintf(stderr, "FAILED due NOT FITTING TO BUFFER SIZE\n");
@@ -874,35 +959,36 @@ int gpu_scan(struct gpu_rt *rt,
                           0, sizeof(uint32_t), &zero, 0, NULL, NULL);
 
     /* Wait for data upload to complete */
+    clFinish(rt->queue);
     clFinish(rt->queue); 
-    fflush(stdout);
+    fflush(stdout);  // Force flush stdout
 
     /* Calculate launch params */
     uint32_t chunk_size;
 
+    
     if (file_length >= 128 * 1024 * 1024)      chunk_size = 524288;
     else if (file_length >= 64 * 1024 * 1024)   chunk_size = 262144;
     else if (file_length >= 16 * 1024 * 1024)   chunk_size = 131072;
     else if (file_length >= 4 * 1024 * 1024)    chunk_size = 65536;
     else if (file_length >= 1 * 1024 * 1024)    chunk_size = 32768;
     else                                         chunk_size = 16384;
+
+    //fprintf(stderr, "DEBUG: file_length=%u, chunk_size=%u\n", file_length, chunk_size);
+
     if (maxpatlen < 2) maxpatlen = 2;
-
-    /* Ensure chunk_size is at least maxpatlen to avoid underflow */
-    // if (chunk_size < maxpatlen) {
-    //     chunk_size = maxpatlen;
-    // }
-
-    if (chunk_size < maxpatlen * 2) {
-    chunk_size = maxpatlen * 2;
-    }
     uint32_t file_offset = 0;
     uint32_t stride = chunk_size - (maxpatlen - 1);
     uint32_t chunks = (file_length + stride - 1) / stride;
-    size_t gws = chunks;
+    size_t gws = chunks;  // One work item per chunk
     if (gws == 0) gws = 1;
-    gws = ((gws + 255) / 256) * 256;
+    gws = ((gws + 255) / 256) * 256;  // Round up to workgroup size
     uint32_t max_trackers = GPU_MAX_TRACKERS;
+
+    // fprintf(stderr, "DEBUG: max_trackers=%u, GPU_MAX_TRACKERS=%u\n", 
+    //     max_trackers, GPU_MAX_TRACKERS);
+
+    // fprintf(stderr, "DEBUG: stride=%u, chunks=%u, gws=%zu\n", stride, chunks, gws);
 
     uint32_t is_elf_target = 0;
     if (file_length >= 4 && file_buffer[0] == 0x7F && 
@@ -911,243 +997,252 @@ int gpu_scan(struct gpu_rt *rt,
     }
 
     /* Set kernel args for MAIN kernel */
-    int a = 0; 
+   int a = 0; 
+
+   //fprintf(stderr, "=== SETTING MAIN KERNEL ARGS ===\n");
 
     err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->scan_buffer);
+  //  fprintf(stderr, "Arg %d: scan_buffer=%p, err=%d\n", a-1, (void*)rt->scan_buffer, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set scan_buffer arg\n");
 
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &file_offset);
+   // fprintf(stderr, "Arg %d: file_offset=%u, err=%d\n", a-1, file_offset, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set file_offset arg\n");
 
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &file_length);
+   // fprintf(stderr, "Arg %d: file_length=%u, err=%d\n", a-1, file_length, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set file_length arg\n");
 
-    /* Use the matcher's DFA buffers */
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &m->dfa_next);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->dfa_next);
+   // fprintf(stderr, "Arg %d: dfa_next=%p, err=%d\n", a-1, (void*)rt->dfa_next, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set dfa_next arg\n");
+    if (!rt->dfa_next) fprintf(stderr, "ERROR: dfa_next is NULL!\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &m->dfa_out_index);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->dfa_out_index);
+   // fprintf(stderr, "Arg %d: dfa_out_index=%p, err=%d\n", a-1, (void*)rt->dfa_out_index, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set dfa_out_index arg\n");
+    if (!rt->dfa_out_index) fprintf(stderr, "ERROR: dfa_out_index is NULL!\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &m->dfa_out_count);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->dfa_out_count);
+   // fprintf(stderr, "Arg %d: dfa_out_count=%p, err=%d\n", a-1, (void*)rt->dfa_out_count, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set dfa_out_count arg\n");
+    if (!rt->dfa_out_count) fprintf(stderr, "ERROR: dfa_out_count is NULL!\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &m->dfa_out_pat);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->dfa_out_pat);
+    //fprintf(stderr, "Arg %d: dfa_out_pat=%p, err=%d\n", a-1, (void*)rt->dfa_out_pat, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set dfa_out_pat arg\n");
+    if (!rt->dfa_out_pat) fprintf(stderr, "ERROR: dfa_out_pat is NULL!\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &m->dfa_states);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &rt->dfa_states);
+  //  fprintf(stderr, "Arg %d: dfa_states=%u, err=%d\n", a-1, rt->dfa_states, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set dfa_states arg\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &m->d_patterns);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->d_patterns);
+    //fprintf(stderr, "Arg %d: d_patterns=%p, err=%d\n", a-1, (void*)rt->d_patterns, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set d_patterns arg\n");
+    if (!rt->d_patterns) fprintf(stderr, "ERROR: d_patterns is NULL!\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &m->num_patterns);
-    if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set num_patterns arg\n");
+    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &rt->num_gpu_patterns);
+   // fprintf(stderr, "Arg %d: num_gpu_patterns=%u, err=%d\n", a-1, rt->num_gpu_patterns, err);
+    if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set num_gpu_patterns arg\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &m->d_pattern_bytes);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->d_pattern_bytes);
+   // fprintf(stderr, "Arg %d: d_pattern_bytes=%p, err=%d\n", a-1, (void*)rt->d_pattern_bytes, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set d_pattern_bytes arg\n");
+    if (!rt->d_pattern_bytes) fprintf(stderr, "ERROR: d_pattern_bytes is NULL!\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &m->d_prefix_bytes);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->d_prefix_bytes);
+ //   fprintf(stderr, "Arg %d: d_prefix_bytes=%p, err=%d\n", a-1, (void*)rt->d_prefix_bytes, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set d_prefix_bytes arg\n");
+    if (!rt->d_prefix_bytes) fprintf(stderr, "ERROR: d_prefix_bytes is NULL!\n");
 
     err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->d_tracker_pool);
+  //  fprintf(stderr, "Arg %d: d_tracker_pool=%p, err=%d\n", a-1, (void*)rt->d_tracker_pool, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set d_tracker_pool arg\n");
+    if (!rt->d_tracker_pool) fprintf(stderr, "ERROR: d_tracker_pool is NULL!\n");
 
     err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->d_tracker_count);
+  //  fprintf(stderr, "Arg %d: d_tracker_count=%p, err=%d\n", a-1, (void*)rt->d_tracker_count, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set d_tracker_count arg\n");
+    if (!rt->d_tracker_count) fprintf(stderr, "ERROR: d_tracker_count is NULL!\n");
 
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &max_trackers);
+  //  fprintf(stderr, "Arg %d: max_trackers=%u, err=%d\n", a-1, max_trackers, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set max_trackers arg\n");
 
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &chunk_size);
+   // fprintf(stderr, "Arg %d: chunk_size=%u, err=%d\n", a-1, chunk_size, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set chunk_size arg\n");
 
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &stride);
+   // fprintf(stderr, "Arg %d: stride=%u, err=%d\n", a-1, stride, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set stride arg\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->d_result);
-    if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set d_result arg\n");
+    /* Arg 17 is local memory, no check needed */
+    err = clSetKernelArg(rt->kernel, a++, 256 * sizeof(uint32_t), NULL);
+   // fprintf(stderr, "Arg %d: local memory, err=%d\n", a-1, err);
+    if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set local memory arg\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &m->num_pattern_bytes);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->d_result);
+  //  fprintf(stderr, "Arg %d: d_result=%p, err=%d\n", a-1, (void*)rt->d_result, err);
+    if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set d_result arg\n");
+    if (!rt->d_result) fprintf(stderr, "ERROR: d_result is NULL!\n");
+
+    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &rt->num_pattern_bytes);
+  //  fprintf(stderr, "Arg %d: num_pattern_bytes=%u, err=%d\n", a-1, rt->num_pattern_bytes, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set num_pattern_bytes arg\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &m->num_prefix_bytes);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &rt->num_prefix_bytes);
+   // fprintf(stderr, "Arg %d: num_prefix_bytes=%u, err=%d\n", a-1, rt->num_prefix_bytes, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set num_prefix_bytes arg\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &m->out_total);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &rt->out_total);
+   // fprintf(stderr, "Arg %d: out_total=%u, err=%d\n", a-1, rt->out_total, err);
     if (err != CL_SUCCESS) fprintf(stderr, "ERROR: Failed to set out_total arg\n");
 
-    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &m->d_lsig_metas);
-    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &m->num_lsigs);
+    
+
+
+    err = clSetKernelArg(rt->kernel, a++, sizeof(cl_mem), &rt->d_lsig_metas);
+    err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &rt->num_lsigs);
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &container_type);
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &entry_point);
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &is_pe_target);
     err = clSetKernelArg(rt->kernel, a++, sizeof(uint32_t), &is_elf_target);
 
+    
+    fprintf(stderr, "Total args set: %d \n", a); 
     fflush(stderr);
- 
-    fprintf(stderr, "dfa_states = %u\n", m->dfa_states);
-    fprintf(stderr, "out_total = %u\n", m->out_total);
-    fprintf(stderr, "num_patterns = %u\n", m->num_patterns);
-    fprintf(stderr, "num_pattern_bytes = %u\n", m->num_pattern_bytes);
-    fprintf(stderr, "num_prefix_bytes = %u\n", m->num_prefix_bytes);
-    fprintf(stderr, "num_lsigs = %u\n", m->num_lsigs);
-    fprintf(stderr, "expr_bytecode_size = %u\n", m->expr_bytecode_size);
-    fprintf(stderr, "chunk_size = %u\n", chunk_size);
-    fprintf(stderr, "stride = %u\n", stride);
-    fprintf(stderr, "max_trackers = %u\n", max_trackers);
 
-
-    fprintf(stderr, "Buffer check:\n");
-fprintf(stderr, "  scan_buffer: %p\n", (void*)rt->scan_buffer);
-fprintf(stderr, "  dfa_next: %p\n", (void*)m->dfa_next);
-fprintf(stderr, "  dfa_out_index: %p\n", (void*)m->dfa_out_index);
-fprintf(stderr, "  dfa_out_count: %p\n", (void*)m->dfa_out_count);
-fprintf(stderr, "  dfa_out_pat: %p\n", (void*)m->dfa_out_pat);
-fprintf(stderr, "  d_patterns: %p\n", (void*)m->d_patterns);
-fprintf(stderr, "  d_pattern_bytes: %p\n", (void*)m->d_pattern_bytes);
-fprintf(stderr, "  d_prefix_bytes: %p\n", (void*)m->d_prefix_bytes);
-fprintf(stderr, "  d_tracker_pool: %p\n", (void*)rt->d_tracker_pool);
-fprintf(stderr, "  d_tracker_count: %p\n", (void*)rt->d_tracker_count);
-fprintf(stderr, "  d_result: %p\n", (void*)rt->d_result);
-fprintf(stderr, "  d_lsig_metas: %p\n", (void*)m->d_lsig_metas);
-
-    size_t actual_next_size;
-    clGetMemObjectInfo(m->dfa_next, CL_MEM_SIZE, sizeof(actual_next_size), &actual_next_size, NULL);
-    fprintf(stderr, "PRE-LAUNCH CHECK: dfa_states=%u, buffer_size=%zu, expected_size=%zu\n",
-            m->dfa_states, actual_next_size, (size_t)m->dfa_states * 256 * sizeof(uint32_t));
-    
     /* Launch MAIN kernel */
-    size_t local_work_size = 64;
-    err = clEnqueueNDRangeKernel(rt->queue, rt->kernel, 1, NULL,
-                                  &gws, &local_work_size, 0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "GPU: Main kernel launch failed: %d\n", err);
-        return GPU_RESULT_BREAK;
-    }
+err = clEnqueueNDRangeKernel(rt->queue, rt->kernel, 1, NULL,
+                              &gws, NULL, 0, NULL, NULL);
+if (err != CL_SUCCESS) {
+    fprintf(stderr, "GPU: Main kernel launch failed: %d\n", err);
+    return GPU_RESULT_BREAK;
+}
 
-    /* Force completion and flush */
-    clFinish(rt->queue);
-    fflush(stdout);
+/* Force completion and flush */
+clFinish(rt->queue);
+clFinish(rt->queue);  // Do it twice
+fflush(stdout); 
 
-    /* If we have logical signatures, run evaluation kernel */
-    if (m->num_lsigs > 0 && rt->lsig_kernel) {
-        /* Get tracker count from main kernel */
-        uint32_t tracker_count;
-        clEnqueueReadBuffer(rt->queue, rt->d_tracker_count, CL_TRUE,
-                            0, sizeof(uint32_t), &tracker_count, 0, NULL, NULL);
-        fprintf(stderr, "GPU: tracker_count = %u\n", tracker_count);
-        /* Get TDB information from context */
-        uint32_t file_length_arg = file_length;
-        uint32_t entry_point = (tinfo && tinfo->status == 1) ? tinfo->exeinfo.ep : 0;
-        uint32_t num_sections = (tinfo && tinfo->status == 1) ? tinfo->exeinfo.nsections : 0;
-        uint32_t container_type = (ctx && ctx->recursion_level >= 0) ? 
-                                cli_recursion_stack_get_type(ctx, -1) : 0;
-        uint32_t num_intermediates = 0;
-        uint32_t is_pe_target = (tinfo && tinfo->status == 1) ? 1 : 0;
-        uint32_t expr_bytecode_size = m->expr_bytecode_size;
-
-        /* Get intermediates (parent types) */
-        uint32_t intermediates[8] = {0};
-        if (ctx && ctx->recursion_level >= 0) {
-            int32_t j = -2;
-            while (j >= -((int32_t)ctx->recursion_level) && num_intermediates < 8) {
-                uint32_t type = cli_recursion_stack_get_type(ctx, j);
-                if (type != CL_TYPE_ANY) {
-                    intermediates[num_intermediates++] = type;
-                }
-                j--;
-            }
-        }
-        
-        /* Create intermediates buffer */
-        cl_mem d_intermediates = NULL;
-        if (num_intermediates > 0) {
-            d_intermediates = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                             num_intermediates * sizeof(uint32_t), intermediates, NULL);
-        } else {
-            uint32_t dummy = 0;
-            d_intermediates = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                             sizeof(uint32_t), &dummy, NULL);
-        }
-        
-        /* Create dummy icon buffer */
-        uint32_t dummy_icon = 0;
-        cl_mem d_icon_data = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                             sizeof(uint32_t), &dummy_icon, NULL);
-        uint32_t icon_data_size = 0;
-        
-        /* Set args for logical signature kernel */
-        int a2 = 0;
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(cl_mem), &m->d_lsig_metas);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &m->num_lsigs);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(cl_mem), &m->d_expr_bytecode);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &expr_bytecode_size);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(cl_mem), &rt->d_tracker_pool);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &tracker_count);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &file_length_arg);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &entry_point);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &num_sections);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &container_type);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(cl_mem), &d_intermediates);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &num_intermediates);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &is_pe_target);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(cl_mem), &d_icon_data);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(uint32_t), &icon_data_size);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(cl_mem), &rt->d_result);
-        clSetKernelArg(rt->lsig_kernel, a2++, sizeof(cl_mem), &m->d_virname_pool);
-        
-        size_t gws_lsig = ((m->num_lsigs + 255) / 256) * 256;
-      
-        clEnqueueNDRangeKernel(rt->queue, rt->lsig_kernel, 1, NULL,
-                            &gws_lsig, NULL, 0, NULL, NULL);
-        
-        /* Wait for kernel to complete before cleaning up */
-        clFinish(rt->queue);
-        fflush(stdout);
-        
-        if (d_intermediates) clReleaseMemObject(d_intermediates);
-        if (d_icon_data) clReleaseMemObject(d_icon_data);
-    }
- 
-    clFinish(rt->queue);
-    fflush(stdout);
+/* If we have logical signatures, run evaluation kernel */
+/* If we have logical signatures, run evaluation kernel */
+/* If we have logical signatures, run evaluation kernel */
+if (rt->num_lsigs > 0 && rt->lsig_kernel) {
+    /* Get tracker count from main kernel */
+    uint32_t tracker_count;
+    clEnqueueReadBuffer(rt->queue, rt->d_tracker_count, CL_TRUE,
+                        0, sizeof(uint32_t), &tracker_count, 0, NULL, NULL);
     
+    /* Get TDB information from context */
+    uint32_t file_length_arg = file_length;
+    uint32_t entry_point = (tinfo && tinfo->status == 1) ? tinfo->exeinfo.ep : 0;
+    uint32_t num_sections = (tinfo && tinfo->status == 1) ? tinfo->exeinfo.nsections : 0;
+    uint32_t container_type = (ctx && ctx->recursion_level >= 0) ? 
+                            cli_recursion_stack_get_type(ctx, -1) : 0;
+    uint32_t num_intermediates = 0;
+    uint32_t is_pe_target = (tinfo && tinfo->status == 1) ? 1 : 0;
+    uint32_t expr_bytecode_size = rt->expr_bytecode_size;  /* Make sure this is stored in rt struct */
+
+    /* Get intermediates (parent types) */
+    uint32_t intermediates[8] = {0};
+    if (ctx && ctx->recursion_level >= 0) {
+        int32_t j = -2;
+        while (j >= -((int32_t)ctx->recursion_level) && num_intermediates < 8) {
+            uint32_t type = cli_recursion_stack_get_type(ctx, j);
+            if (type != CL_TYPE_ANY) {
+                intermediates[num_intermediates++] = type;
+            }
+            j--;
+        }
+    }
+    
+    /* Create intermediates buffer */
+    cl_mem d_intermediates = NULL;
+    if (num_intermediates > 0) {
+        d_intermediates = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                         num_intermediates * sizeof(uint32_t), intermediates, NULL);
+    } else {
+        uint32_t dummy = 0;
+        d_intermediates = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                         sizeof(uint32_t), &dummy, NULL);
+    }
+    
+    /* Create dummy icon buffer */
+    uint32_t dummy_icon = 0;
+    cl_mem d_icon_data = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                         sizeof(uint32_t), &dummy_icon, NULL);
+    uint32_t icon_data_size = 0;
+    
+    /* Set args for logical signature kernel */
+    int a = 0;
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(cl_mem), &rt->d_lsig_metas);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &rt->num_lsigs);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(cl_mem), &rt->d_expr_bytecode);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &expr_bytecode_size);  /* NEW */
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(cl_mem), &rt->d_tracker_pool);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &tracker_count);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &file_length_arg);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &entry_point);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &num_sections);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &container_type);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(cl_mem), &d_intermediates);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &num_intermediates);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &is_pe_target);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(cl_mem), &d_icon_data);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(uint32_t), &icon_data_size);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(cl_mem), &rt->d_result);
+    clSetKernelArg(rt->lsig_kernel, a++, sizeof(cl_mem), &rt->d_virname_pool);
+    
+     
+    
+    size_t gws = ((rt->num_lsigs + 255) / 256) * 256;
+    clEnqueueNDRangeKernel(rt->queue, rt->lsig_kernel, 1, NULL,
+                        &gws, NULL, 0, NULL, NULL);
+    
+    /* Wait for kernel to complete before cleaning up */
+    clFinish(rt->queue);
+    fflush(stdout); 
+    
+     
+    if (d_intermediates) clReleaseMemObject(d_intermediates);
+    if (d_icon_data) clReleaseMemObject(d_icon_data);
+}
+
+    clFinish(rt->queue); 
+        clFinish(rt->queue);
+        fflush(stdout); 
     /* Read final result */
     gpu_scan_result_t h_result;
     clEnqueueReadBuffer(rt->queue, rt->d_result, CL_TRUE,
                         0, sizeof(gpu_scan_result_t), &h_result, 0, NULL, NULL);
 
-    fprintf(stderr, "GPU RESULT: result_code=%d, virname_offset=%u, virname_len=%u\n",
-            h_result.result_code, h_result.virname_offset, h_result.virname_len);
+                        fprintf(stderr, "GPU RESULT: result_code=%d, virname_offset=%u, virname_len=%u\n",
+        h_result.result_code, h_result.virname_offset, h_result.virname_len);
 
-    if (h_result.needs_cpu_fallback) {
-        fprintf(stderr, "GPU: Falling back to CPU due to needs_cpu_fallback flag being true %u\n", 
-                h_result.fallback_offset);
-        return GPU_RESULT_BREAK;
-    }
 
-    if (h_result.result_code == GPU_RESULT_VIRUS && h_result.virname_offset < m->virname_pool_size) {
-        fprintf(stderr, "Virus name from pool: '%s'\n", 
-                m->h_virname_pool + h_result.virname_offset);
-    }
+        if (h_result.needs_cpu_fallback) {
+    fprintf(stderr, "GPU: Falling back to CPU due to regex pattern at offset %u\n", 
+            h_result.fallback_offset);
+    return GPU_RESULT_BREAK;  /* This will trigger CPU fallback */
+}
+
+if (h_result.result_code == GPU_RESULT_VIRUS && h_result.virname_offset < rt->virname_pool_size) {
+    fprintf(stderr, "Virus name from pool: '%s'\n", 
+            rt->h_virname_pool + h_result.virname_offset);
+}
+     
     
     if (h_result.result_code == GPU_RESULT_VIRUS) {
-
-            if (h_result.virname_offset >= m->virname_pool_size) {
-                fprintf(stderr, "ERROR: Invalid virname_offset=%u >= pool_size=%u\n",
-                        h_result.virname_offset, m->virname_pool_size);
-            } else {
-                fprintf(stderr, "Virus: %s\n", m->h_virname_pool + h_result.virname_offset);
-            }
-        // fprintf(stderr, "[GPU] VIRUS DETECTED BY GPU (matcher %u): %s\n", 
-        //         matcher_idx, m->h_virname_pool + h_result.virname_offset);
-        *virname = m->h_virname_pool + h_result.virname_offset;
+        *virname = rt->h_virname_pool + h_result.virname_offset;
         return GPU_RESULT_VIRUS;
     }
     
     return h_result.result_code;
 }
+
 
 /**
  * Convert logical expression string to bytecode
@@ -1247,42 +1342,42 @@ static int compile_logical_expr(const char *expr,
 
  
 
-// cl_error_t gpu_collect_batch_results(struct gpu_rt *rt, struct cli_matcher *root,
-//                                       cli_ctx *ctx, const char **virname)
-// {
-//     if (!rt->batch.active) return CL_SUCCESS;
+cl_error_t gpu_collect_batch_results(struct gpu_rt *rt, struct cli_matcher *root,
+                                      cli_ctx *ctx, const char **virname)
+{
+    if (!rt->batch.active) return CL_SUCCESS;
     
-//     cl_error_t final_result = CL_CLEAN;
+    cl_error_t final_result = CL_CLEAN;
     
-//     for (uint32_t f = 0; f < rt->batch.count; f++) {
-//         if (rt->batch.results[f] == CL_VIRUS) {
-//             if (virname && rt->batch.virnames[f])
-//                 *virname = rt->batch.virnames[f];
-//             final_result = CL_VIRUS;
-//             break;
-//         }
-//         if (rt->batch.results[f] == CL_BREAK) {
-//             final_result = CL_BREAK;
-//         }
-//     }
+    for (uint32_t f = 0; f < rt->batch.count; f++) {
+        if (rt->batch.results[f] == CL_VIRUS) {
+            if (virname && rt->batch.virnames[f])
+                *virname = rt->batch.virnames[f];
+            final_result = CL_VIRUS;
+            break;
+        }
+        if (rt->batch.results[f] == CL_BREAK) {
+            final_result = CL_BREAK;
+        }
+    }
     
-//     /* Cleanup */
-//     for (uint32_t i = 0; i < rt->batch.count; i++) {
-//         if (rt->batch.buffers[i]) {
-//             free((void*)rt->batch.buffers[i]);
-//             rt->batch.buffers[i] = NULL;
-//         }
-//     }
+    /* Cleanup */
+    for (uint32_t i = 0; i < rt->batch.count; i++) {
+        if (rt->batch.buffers[i]) {
+            free((void*)rt->batch.buffers[i]);
+            rt->batch.buffers[i] = NULL;
+        }
+    }
     
-//     free(rt->batch.hit_counts); rt->batch.hit_counts = NULL;
-//     free(rt->batch.results); rt->batch.results = NULL;
-//     free(rt->batch.virnames); rt->batch.virnames = NULL;
-//     rt->batch.count = 0;
-//     rt->batch.total_bytes = 0;
-//     rt->batch.active = false;
+    free(rt->batch.hit_counts); rt->batch.hit_counts = NULL;
+    free(rt->batch.results); rt->batch.results = NULL;
+    free(rt->batch.virnames); rt->batch.virnames = NULL;
+    rt->batch.count = 0;
+    rt->batch.total_bytes = 0;
+    rt->batch.active = false;
     
-//     return final_result;
-// }
+    return final_result;
+}
 
  
 
@@ -1310,186 +1405,69 @@ static int compile_logical_expr(const char *expr,
 int gpu_rt_init(struct gpu_rt *rt)
 {
     cl_int err;
-    cl_platform_id platforms[10];
-    cl_uint num_platforms;
-    cl_device_id devices[10];
-    cl_uint num_devices;
-    char platform_name[256];
-    char device_name[256];
-    int i, j;
     
     if (!rt) return -1;
     if (rt->initialized) return 0;
     
-    /* Initialize all matcher slots to zero */
-    for (i = 0; i < GPU_MAX_MATCHERS; i++) {
-        memset(&rt->matchers[i], 0, sizeof(struct gpu_matcher_data));
-    }
-    
-    /* Get all OpenCL platforms */
-    err = clGetPlatformIDs(10, platforms, &num_platforms);
-    if (err != CL_SUCCESS || num_platforms == 0) {
-        cli_errmsg("GPU: No OpenCL platforms found\n");
+    /* Get OpenCL platform */
+    if (clGetPlatformIDs(1, &rt->platform, NULL) != CL_SUCCESS)
         return -1;
-    }
-    
-    cli_dbgmsg("GPU: Found %u platforms\n", num_platforms);
-    
-    /* Find AMD platform with GPU devices */
-    int found = 0;
-    for (i = 0; i < num_platforms && !found; i++) {
-        clGetPlatformInfo(platforms[i], CL_PLATFORM_NAME, 
-                         sizeof(platform_name), platform_name, NULL);
-        cli_dbgmsg("GPU: Platform %d: %s\n", i, platform_name);
-        
-        /* Check for AMD platform */
-        if (strstr(platform_name, "AMD") || strstr(platform_name, "Advanced")) {
-            /* Try to get GPU devices */
-            err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 
-                                10, devices, &num_devices);
-            if (err == CL_SUCCESS && num_devices > 0) {
-                rt->platform = platforms[i];
-                rt->device = devices[0];
-                
-                clGetDeviceInfo(rt->device, CL_DEVICE_NAME, 
-                               sizeof(device_name), device_name, NULL);
-                cli_dbgmsg("GPU: Selected AMD platform with device: %s\n", device_name);
-                found = 1;
-                break;
-            }
-        }
-    }
-    
-    /* If no AMD GPU, try any GPU */
-    if (!found) {
-        for (i = 0; i < num_platforms && !found; i++) {
-            err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 
-                                10, devices, &num_devices);
-            if (err == CL_SUCCESS && num_devices > 0) {
-                rt->platform = platforms[i];
-                rt->device = devices[0];
-                
-                clGetPlatformInfo(rt->platform, CL_PLATFORM_NAME, 
-                                 sizeof(platform_name), platform_name, NULL);
-                clGetDeviceInfo(rt->device, CL_DEVICE_NAME, 
-                               sizeof(device_name), device_name, NULL);
-                cli_dbgmsg("GPU: Selected platform %s with device: %s\n", 
-                          platform_name, device_name);
-                found = 1;
-                break;
-            }
-        }
-    }
-    
-    if (!found) {
-        cli_errmsg("GPU: No GPU devices found\n");
+
+    /* Get GPU device */
+    if (clGetDeviceIDs(rt->platform, CL_DEVICE_TYPE_GPU,
+                       1, &rt->device, NULL) != CL_SUCCESS)
         return -1;
-    }
 
     /* Create OpenCL context */
     rt->context = clCreateContext(NULL, 1, &rt->device, NULL, NULL, &err);
-    if (!rt->context) {
-        cli_errmsg("GPU: Failed to create context: %d\n", err);
+    if (!rt->context)
         return -1;
-    }
 
     /* Create command queue */
     rt->queue = clCreateCommandQueue(rt->context, rt->device, 0, &err);
-    if (!rt->queue) {
-        cli_errmsg("GPU: Failed to create command queue: %d\n", err);
-        clReleaseContext(rt->context);
+    if (!rt->queue)
+        return -1;
+
+    /* Try flattened kernel first */
+    size_t kernel_len = strlen(gpu_kernel_src);
+    rt->program = clCreateProgramWithSource(
+        rt->context, 1, &gpu_kernel_src, &kernel_len, &err
+    );
+
+       if (err != CL_SUCCESS) {
+        cli_errmsg("GPU: Failed to create batch buffer (err=%d)\n", err);
         return -1;
     }
+    cli_dbgmsg("GPU: Created batch buffer of %zu bytes\n", rt->scan_buffer_size);
 
-    /* Set scan buffer size */
+ /* Initialize batch processing */
+      rt->batch.max_count = 64;
+    rt->batch.buffers = malloc(rt->batch.max_count * sizeof(void*));
+    rt->batch.lengths = malloc(rt->batch.max_count * sizeof(uint32_t));
+    rt->batch.file_offsets = malloc(rt->batch.max_count * sizeof(uint32_t));
     rt->scan_buffer_size = 256 * 1024 * 1024; /* 256MB */
     
-    /* ========== CREATE ALL NECESSARY BUFFERS ========== */
-    
-    /* Scan buffer - for file data */
     rt->scan_buffer = clCreateBuffer(rt->context, CL_MEM_READ_WRITE,
-                                     rt->scan_buffer_size, NULL, &err);
-    if (err != CL_SUCCESS || !rt->scan_buffer) {
-        cli_errmsg("GPU: Failed to create scan buffer: %d\n", err);
-        goto error;
-    }
-    fprintf(stderr, "GPU: Created scan_buffer (%u MB)\n", rt->scan_buffer_size / (1024*1024));
-    
-    /* Tracker pool - for multi-part pattern matching (CRITICAL) */
-    rt->d_tracker_pool = clCreateBuffer(rt->context, CL_MEM_READ_WRITE,
-                                        GPU_MAX_TRACKERS * sizeof(gpu_multipart_tracker_t),
-                                        NULL, &err);
-    if (err != CL_SUCCESS || !rt->d_tracker_pool) {
-        cli_errmsg("GPU: Failed to create tracker pool buffer: %d\n", err);
-        goto error;
-    }
-    fprintf(stderr, "GPU: Created d_tracker_pool buffer\n");
-    
-    /* Tracker count (CRITICAL) */
-    rt->d_tracker_count = clCreateBuffer(rt->context, CL_MEM_READ_WRITE,
-                                         sizeof(uint32_t), NULL, &err);
-    if (err != CL_SUCCESS || !rt->d_tracker_count) {
-        cli_errmsg("GPU: Failed to create tracker count buffer: %d\n", err);
-        goto error;
-    }
-    fprintf(stderr, "GPU: Created d_tracker_count buffer\n");
-    
-    /* Result buffer (CRITICAL) */
-    rt->d_result = clCreateBuffer(rt->context, CL_MEM_READ_WRITE,
-                                  sizeof(gpu_scan_result_t), NULL, &err);
-    if (err != CL_SUCCESS || !rt->d_result) {
-        cli_errmsg("GPU: Failed to create result buffer: %d\n", err);
-        goto error;
-    }
-    fprintf(stderr, "GPU: Created d_result buffer\n");
-    
-    /* Get device info for debugging */
-    cl_ulong max_mem_alloc_size;
-    cl_ulong global_mem_size;
-    cl_uint max_compute_units;
-    
-    clGetDeviceInfo(rt->device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, 
-                    sizeof(max_mem_alloc_size), &max_mem_alloc_size, NULL);
-    clGetDeviceInfo(rt->device, CL_DEVICE_GLOBAL_MEM_SIZE, 
-                    sizeof(global_mem_size), &global_mem_size, NULL);
-    clGetDeviceInfo(rt->device, CL_DEVICE_MAX_COMPUTE_UNITS, 
-                    sizeof(max_compute_units), &max_compute_units, NULL);
-    
-    fprintf(stderr, "GPU Device Info:\n");
-    fprintf(stderr, "  Global Memory: %llu MB\n", (unsigned long long)global_mem_size / (1024*1024));
-    fprintf(stderr, "  Max Allocation: %llu MB\n", (unsigned long long)max_mem_alloc_size / (1024*1024));
-    fprintf(stderr, "  Compute Units: %u\n", max_compute_units);
-    
-    /* Build kernel from source */
-    FILE *fp = fopen("../libclamav/gpu_ac_kernel.cl", "r");
-    if (!fp) {
-        cli_errmsg("GPU: Failed to open kernel file\n");
-        goto error;
-    }
-
-    fseek(fp, 0, SEEK_END);
-    long kernel_len = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    char *kernel_src = malloc(kernel_len + 1);
-    fread(kernel_src, 1, kernel_len, fp);
-    kernel_src[kernel_len] = '\0';
-    fclose(fp);
-
-    rt->program = clCreateProgramWithSource(rt->context, 1, 
-                                            (const char **)&kernel_src, 
-                                            &kernel_len, &err);
-    free(kernel_src);
-    if (err != CL_SUCCESS || !rt->program) {
-        cli_errmsg("GPU: Failed to create program from source: %d\n", err);
-        goto error;
-    }
-    
-    /* Build with optimization options */
-    const char *build_opts = "-cl-std=CL1.2 -cl-mad-enable -cl-fast-relaxed-math";
-    err = clBuildProgram(rt->program, 1, &rt->device, build_opts, NULL, NULL);
-    
+                                             rt->scan_buffer_size,
+                                             NULL, &err);
     if (err != CL_SUCCESS) {
+        cli_errmsg("GPU: Failed to create batch buffer\n");
+        return -1;
+    }
+    
+    rt->batch.count = 0;
+    rt->batch.total_bytes = 0;
+    rt->batch.active = false;
+    
+    /* Allocate event arrays (will be realloc'd as needed) */
+    rt->batch.kernel_events = NULL;
+    rt->batch.count_events = NULL;
+    rt->batch.hit_counts = NULL;
+    
+    /* Build with minimal options */
+    cl_int rc = clBuildProgram(rt->program, 1, &rt->device, NULL, NULL, NULL);
+    
+    if (rc != CL_SUCCESS) {
         size_t log_size;
         clGetProgramBuildInfo(rt->program, rt->device, CL_PROGRAM_BUILD_LOG,
                               0, NULL, &log_size);
@@ -1498,76 +1476,37 @@ int gpu_rt_init(struct gpu_rt *rt)
             clGetProgramBuildInfo(rt->program, rt->device, CL_PROGRAM_BUILD_LOG,
                                   log_size, log, NULL);
             log[log_size] = 0;
-            cli_errmsg("GPU kernel build failed:\n%s\n", log);
+            cli_errmsg("GPU flattened kernel build failed:\n%s\n", log);
             free(log);
         }
-        goto error;
+        clReleaseProgram(rt->program);
+        rt->program = NULL;
+        return -1;
     }
     
-    /* Create main kernel */
+    /* Create flattened kernel */
     rt->kernel = clCreateKernel(rt->program, "ac_scan_validate", &err);
     if (err != CL_SUCCESS || !rt->kernel) {
-        cli_errmsg("GPU: Failed to create main kernel: %d\n", err);
-        goto error;
+        cli_errmsg("GPU: Failed to create flattened kernel (%d)\n", err);
+        clReleaseProgram(rt->program);
+        rt->program = NULL;
+        return -1;
     }
-    fprintf(stderr, "GPU: Created main kernel\n");
+
     
-    /* Create logical signature kernel (optional) */
+
     rt->lsig_kernel = clCreateKernel(rt->program, "evaluate_logical_sigs", &err);
     if (err != CL_SUCCESS || !rt->lsig_kernel) {
         cli_dbgmsg("GPU: Logical signature kernel not available (%d)\n", err);
         rt->lsig_kernel = NULL;
-        /* Not fatal - continue without logical kernel */
-    } else {
-        fprintf(stderr, "GPU: Created logical signature kernel\n");
+        /* This is not fatal - continue without logical kernel */
     }
-    
-    /* Initialize batch processing structures */
-    rt->batch.max_count = 64;
-    rt->batch.buffers = malloc(rt->batch.max_count * sizeof(void*));
-    rt->batch.lengths = malloc(rt->batch.max_count * sizeof(uint32_t));
-    rt->batch.file_offsets = malloc(rt->batch.max_count * sizeof(uint32_t));
-    rt->batch.kernel_events = NULL;
-    rt->batch.count_events = NULL;
-    rt->batch.hit_counts = NULL;
-    rt->batch.count = 0;
-    rt->batch.total_bytes = 0;
-    rt->batch.active = false;
-    
-    if (!rt->batch.buffers || !rt->batch.lengths || !rt->batch.file_offsets) {
-        cli_errmsg("GPU: Failed to allocate batch structures\n");
-        goto error;
-    }
-    
-    /* Initialize global state */
-    rt->dfa_uploaded = 0;
-    rt->num_lsigs = 0;
-    rt->num_gpu_patterns = 0;
-    rt->virname_pool_size = 0;
-    rt->h_virname_pool = NULL;
+        
     rt->initialized = 1;
-    
-    fprintf(stderr, "GPU: gpu_rt_init SUCCESS\n");
+    cli_dbgmsg("GPU: Flattened kernel initialized successfully\n");
     return 0;
-    
-error:
-    /* Cleanup on error */
-    if (rt->scan_buffer) { clReleaseMemObject(rt->scan_buffer); rt->scan_buffer = NULL; }
-    if (rt->d_tracker_pool) { clReleaseMemObject(rt->d_tracker_pool); rt->d_tracker_pool = NULL; }
-    if (rt->d_tracker_count) { clReleaseMemObject(rt->d_tracker_count); rt->d_tracker_count = NULL; }
-    if (rt->d_result) { clReleaseMemObject(rt->d_result); rt->d_result = NULL; }
-    if (rt->kernel) { clReleaseKernel(rt->kernel); rt->kernel = NULL; }
-    if (rt->lsig_kernel) { clReleaseKernel(rt->lsig_kernel); rt->lsig_kernel = NULL; }
-    if (rt->program) { clReleaseProgram(rt->program); rt->program = NULL; }
-    if (rt->queue) { clReleaseCommandQueue(rt->queue); rt->queue = NULL; }
-    if (rt->context) { clReleaseContext(rt->context); rt->context = NULL; }
-    
-    if (rt->batch.buffers) { free(rt->batch.buffers); rt->batch.buffers = NULL; }
-    if (rt->batch.lengths) { free(rt->batch.lengths); rt->batch.lengths = NULL; }
-    if (rt->batch.file_offsets) { free(rt->batch.file_offsets); rt->batch.file_offsets = NULL; }
-    
-    return -1;
 }
+
 
  
 
@@ -1587,7 +1526,7 @@ error:
  * ============================================ */
  struct gpu_flattened_dfa *gpu_build_flattened_dfa(struct cli_matcher *root)
 {
-    fprintf(stderr, "gpu_build_flattened_dfa ENTER: root=%p, type=%u\n", 
+     fprintf(stderr, "gpu_build_flattened_dfa ENTER: root=%p, type=%u\n", 
             (void*)root, root ? root->type : 999);
     cli_dbgmsg("GPU-DFA: Building flattened DFA for matcher %p\n", (void*)root);
     
@@ -1634,7 +1573,7 @@ error:
     /* Allocate flattened DFA tables */
     flat->next = cli_malloc(num_states * 256 * sizeof(uint32_t));
     flat->out_index = cli_malloc(num_states * sizeof(uint32_t));
-    flat->out_count = cli_calloc(num_states, sizeof(uint32_t));
+    flat->out_count = cli_calloc(num_states, sizeof(uint16_t));
     
     fprintf(stderr, "STEP 5: Allocated tables: next=%p, out_index=%p, out_count=%p\n", 
             flat->next, flat->out_index, flat->out_count);
@@ -1644,18 +1583,15 @@ error:
         goto error;
     }
     
-    /* Count total outputs - NOW including entire failure chain */
+    /* Count total outputs */
     uint32_t total_out = 0;
     for (uint32_t s = 0; s < num_states; s++) {
         struct cli_ac_node *node = states[s];
+        struct cli_ac_list *l;
         
-        /* Count outputs from node and ALL failure ancestors */
-        struct cli_ac_node *fail_node = node;
-        while (fail_node) {
-            for (struct cli_ac_list *l = fail_node->list; l; l = l->next) {
-                total_out++;
-            }
-            fail_node = fail_node->fail;
+        for (l = node->list; l; l = l->next) total_out++;
+        if (node->fail) {
+            for (l = node->fail->list; l; l = l->next) total_out++;
         }
     }
     fprintf(stderr, "STEP 6: total_out=%u\n", total_out);
@@ -1665,7 +1601,7 @@ error:
         goto error;
     }
  
-    flat->out_pat = cli_malloc(total_out * sizeof(uint32_t));  // Changed to uint32_t
+    flat->out_pat = cli_malloc(total_out * sizeof(uint16_t));
     flat->sig_id = cli_calloc(total_out, sizeof(uint32_t));
     flat->part_no = cli_calloc(total_out, sizeof(uint32_t));
     fprintf(stderr, "STEP 7: Allocated output arrays\n");
@@ -1675,7 +1611,7 @@ error:
         goto error;
     }
     
-    /* Build transition table - this is correct */
+    /* Build transition table */
     memset(flat->next, 0, num_states * 256 * sizeof(uint32_t));
     fprintf(stderr, "STEP 8: Zeroed transition table\n");
     
@@ -1690,80 +1626,75 @@ error:
                     flat->next[node->fail->gpu_state_id * 256 + c];
             }
         }
+        // if (state % 10 == 0) fprintf(stderr, "  Processed state %u\n", state);
     }
-    for (uint32_t state = 0; state < num_states; state++) {
-    struct cli_ac_node *node = states[state];
-    for (uint32_t c = 0; c < 256; c++) {
-        if (flat->next[state * 256 + c] == 0 && node->fail) {
-            flat->next[state * 256 + c] = flat->next[node->fail->gpu_state_id * 256 + c];
-        }
-    }
-}
     fprintf(stderr, "STEP 9: Built transition table\n");
     
-    /* Fill pattern tables with metadata - NOW including ALL failure ancestors */
+    /* Fill pattern tables with metadata */
     uint32_t pat_idx = 0;
     uint32_t max_pattern_id = 0;
     for (uint32_t s = 0; s < num_states; s++) {
         struct cli_ac_node *node = states[s];
-        for (struct cli_ac_list *l = node->list; l; l = l->next) {
+        struct cli_ac_list *l;
+        for (l = node->list; l; l = l->next) {
             if (l->me->gpu_id > max_pattern_id)
                 max_pattern_id = l->me->gpu_id;
         }
     }
     fprintf(stderr, "STEP 10: max_pattern_id=%u\n", max_pattern_id);
 
-    uint8_t *seen_bitmap = NULL; 
-    seen_bitmap = cli_calloc((max_pattern_id + 7) / 8, sizeof(uint8_t));
-    if (!seen_bitmap) goto error;
-    fprintf(stderr, "STEP 11: Allocated bitmap\n");
-    
+    uint8_t *seen_bitmap = NULL;
+    if (max_pattern_id < 65536) {
+        seen_bitmap = cli_calloc((max_pattern_id + 7) / 8, sizeof(uint8_t));
+        fprintf(stderr, "STEP 11: Allocated bitmap\n");
+    }
+
     for (uint32_t state = 0; state < num_states; state++) {
         struct cli_ac_node *node = states[state];
-        
-        memset(seen_bitmap, 0, (max_pattern_id + 7) / 8);
+        struct cli_ac_list *l;
         
         flat->out_index[state] = pat_idx;
         
-        /* CRITICAL: Collect patterns from node and ALL failure ancestors */
-        struct cli_ac_node *fail_node = node;
-        while (fail_node) {
-            for (struct cli_ac_list *l = fail_node->list; l; l = l->next) {
-                struct cli_ac_patt *patt = l->me;
-                if (patt && patt->gpu_id < flat->pat_count) {
+        for (l = node->list; l; l = l->next) {
+            struct cli_ac_patt *patt = l->me;
+            if (patt->gpu_id < flat->pat_count) {
+                if (seen_bitmap) {
                     uint32_t byte = patt->gpu_id >> 3;
                     uint8_t bit = 1 << (patt->gpu_id & 7);
-                    if (!(seen_bitmap[byte] & bit)) {
-                        seen_bitmap[byte] |= bit;
-                        flat->out_pat[pat_idx] = patt->gpu_id;
-                        flat->sig_id[pat_idx] = patt->sigid;
-                        flat->part_no[pat_idx] = patt->partno;
-                        flat->out_count[state]++;
-                        pat_idx++;
-                    }
+                    seen_bitmap[byte] |= bit;
                 }
+                flat->out_pat[pat_idx] = patt->gpu_id;
+                flat->sig_id[pat_idx] = patt->sigid;
+                flat->part_no[pat_idx] = patt->partno;
+                flat->out_count[state]++;
+                pat_idx++;
             }
-            fail_node = fail_node->fail;
         }
         
-        // if (pat_idx > flat->out_index[state]) {
-        //     fprintf(stderr, "STATE %u: %u outputs\n", state, flat->out_count[state]);
-        // }
-    }
-    flat->out_total = pat_idx;
-
-    /* Validate output pattern IDs */
-    uint32_t max_pat_id = 0;
-    for (uint32_t i = 0; i < flat->out_total; i++) {
-        if (flat->out_pat[i] > max_pat_id) max_pat_id = flat->out_pat[i];
-    }
-    fprintf(stderr, "Output pattern IDs: min=0, max=%u, pat_count=%u\n", 
-            max_pat_id, flat->pat_count);
-    
-    /* Debug first few out_pat values */
-    fprintf(stderr, "DEBUG: First 10 out_pat values:\n");
-    for (uint32_t i = 0; i < 10 && i < flat->out_total; i++) {
-        fprintf(stderr, "  out_pat[%u] = %u\n", i, flat->out_pat[i]);
+        if (node->fail) {
+            for (l = node->fail->list; l; l = l->next) {
+                struct cli_ac_patt *patt = l->me;
+                
+                if (patt->gpu_id >= flat->pat_count)
+                    continue;
+                    
+                if (seen_bitmap) {
+                    uint32_t byte = patt->gpu_id >> 3;
+                    uint8_t bit = 1 << (patt->gpu_id & 7);
+                    if (seen_bitmap[byte] & bit)
+                        continue;
+                    seen_bitmap[byte] |= bit;
+                }
+                
+                flat->out_pat[pat_idx] = patt->gpu_id;
+                flat->sig_id[pat_idx] = patt->sigid;
+                flat->part_no[pat_idx] = patt->partno;
+                flat->out_count[state]++;
+                pat_idx++;
+            }
+        }
+        flat->out_total = pat_idx;
+        // if (state % 10 == 0) fprintf(stderr, "  Processed outputs for state %u, pat_idx=%u\n", state, pat_idx);
     }
 
     if (seen_bitmap) free(seen_bitmap);
@@ -1787,112 +1718,118 @@ error:
     free(states);
     return NULL;
 }
+
 /* ============================================
  * FLATTENED DFA UPLOAD
  * Uploads DFA with signature metadata to GPU
  * ============================================ */
-
-
-
-int gpu_rt_upload_flattened_dfa(struct gpu_rt *rt, struct gpu_flattened_dfa *dfa, uint32_t matcher_idx)
+int gpu_rt_upload_flattened_dfa(struct gpu_rt *rt, struct gpu_flattened_dfa *dfa)
 {
     cl_int err;
-    struct gpu_matcher_data *m = &rt->matchers[matcher_idx];
+    uint32_t zero = 0;
     
     if (!rt || !dfa) return -1;
-    
-    /* Clear existing DFA buffers for this matcher */
-    if (m->dfa_next) {
-        clReleaseMemObject(m->dfa_next);
-        m->dfa_next = NULL;
-    }
-    if (m->dfa_out_index) {
-        clReleaseMemObject(m->dfa_out_index);
-        m->dfa_out_index = NULL;
-    }
-    if (m->dfa_out_count) {
-        clReleaseMemObject(m->dfa_out_count);
-        m->dfa_out_count = NULL;
-    }
-    if (m->dfa_out_pat) {
-        clReleaseMemObject(m->dfa_out_pat);
-        m->dfa_out_pat = NULL;
-    }
-    if (m->dfa_sig_id) {
-        clReleaseMemObject(m->dfa_sig_id);
-        m->dfa_sig_id = NULL;
-    }
-    if (m->dfa_part_no) {
-        clReleaseMemObject(m->dfa_part_no);
-        m->dfa_part_no = NULL;
+    if (rt->dfa_uploaded) {
+        cli_dbgmsg("GPU-Flatten: Already uploaded\n");
+        return 0;
     }
     
-    fprintf(stderr, "=== DFA UPLOAD for matcher %u ===\n", matcher_idx);
-    fprintf(stderr, "states=%u, out_total=%u, pat_count=%u\n", 
-            dfa->states, dfa->out_total, dfa->pat_count);
+    cli_dbgmsg("GPU-Flatten: Uploading %u states, %u patterns, %u outputs\n",
+               dfa->states, dfa->pat_count, dfa->out_total);
+
+
+ 
     
     /* Calculate buffer sizes */
-    size_t next_size = (size_t)dfa->states * 256 * sizeof(uint32_t);
-    size_t index_size = (size_t)dfa->states * sizeof(uint32_t);
-    size_t count_size = (size_t)dfa->states * sizeof(uint16_t);
-    size_t pat_size = (size_t)dfa->out_total * sizeof(uint32_t);
-    size_t sig_size = (size_t)dfa->out_total * sizeof(uint32_t);
-    size_t part_size = (size_t)dfa->out_total * sizeof(uint32_t);
-    
-    fprintf(stderr, "next_size=%zu bytes (%zu MB)\n", next_size, next_size/(1024*1024));
-    
-    /* Create buffers - store in matcher slot */
-    m->dfa_next = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                  next_size, dfa->next, &err);
-    if (err != CL_SUCCESS || !m->dfa_next) {
-        fprintf(stderr, "Failed to create dfa_next buffer: %d\n", err);
-        goto error;
-    }
-    
-    m->dfa_out_index = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                       index_size, dfa->out_index, &err);
-    if (err != CL_SUCCESS || !m->dfa_out_index) goto error;
-    
-    m->dfa_out_count = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                       count_size, dfa->out_count, &err);
-    if (err != CL_SUCCESS || !m->dfa_out_count) goto error;
-    
-    m->dfa_out_pat = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                     pat_size, dfa->out_pat, &err);
-    if (err != CL_SUCCESS || !m->dfa_out_pat) goto error;
-    
-    m->dfa_sig_id = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                    sig_size, dfa->sig_id, &err);
-    if (err != CL_SUCCESS || !m->dfa_sig_id) goto error;
-    
-    m->dfa_part_no = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                     part_size, dfa->part_no, &err);
-    if (err != CL_SUCCESS || !m->dfa_part_no) goto error;
-    
-    /* Store metadata in matcher slot */
-    m->dfa_states = dfa->states;
-    m->out_total = dfa->out_total;
-    m->pat_count = dfa->pat_count;
-    m->uploaded = 1;
+    size_t next_size = dfa->states * 256 * sizeof(uint32_t);
+    size_t index_size = dfa->states * sizeof(uint32_t);
+    size_t count_size = dfa->states * sizeof(uint16_t);
+    if (dfa->out_total == 0) {
+    cli_errmsg("GPU-Flatten: out_total is 0, cannot upload\n");
+    return -1;
+}
+    size_t pat_size = dfa->out_total * sizeof(uint16_t);
+    size_t sig_size = dfa->out_total * sizeof(uint32_t);
+    size_t part_size = dfa->out_total * sizeof(uint32_t);
 
-    rt->dfa_uploaded = 1;
-    rt->dfa_states = dfa->states;
-    rt->out_total = dfa->out_total;
+//     fprintf(stderr, "GPU-Flatten: next_size=%zu index_size=%zu count_size=%zu pat_size=%zu\n",
+//         next_size, index_size, count_size, pat_size);
+// fprintf(stderr, "GPU-Flatten: states=%u pat_count=%u out_total=%u\n",
+//         dfa->states, dfa->pat_count, dfa->out_total);
+// fprintf(stderr, "GPU-Flatten: scan_buffer=%zu\n", (size_t)64 * 1024 * 1024);
     
-    fprintf(stderr, "=== DFA UPLOAD SUCCESS for matcher %u ===\n", matcher_idx);
+
+    /* Batch create all buffers first */
+    rt->dfa_next = clCreateBuffer(rt->context, CL_MEM_READ_ONLY,
+                                  next_size, NULL, &err);
+    if (err != CL_SUCCESS) goto error;
+    
+    rt->dfa_out_index = clCreateBuffer(rt->context, CL_MEM_READ_ONLY,
+                                       index_size, NULL, &err);
+    if (err != CL_SUCCESS) goto error;
+    
+    rt->dfa_out_count = clCreateBuffer(rt->context, CL_MEM_READ_ONLY,
+                                       count_size, NULL, &err);
+    if (err != CL_SUCCESS) goto error;
+    
+    rt->dfa_out_pat = clCreateBuffer(rt->context, CL_MEM_READ_ONLY,
+                                     pat_size, NULL, &err);
+    if (err != CL_SUCCESS) goto error;
+    
+    rt->dfa_sig_id = clCreateBuffer(rt->context, CL_MEM_READ_ONLY,
+                                    sig_size, NULL, &err);
+    if (err != CL_SUCCESS) goto error;
+    
+    rt->dfa_part_no = clCreateBuffer(rt->context, CL_MEM_READ_ONLY,
+                                     part_size, NULL, &err);
+    if (err != CL_SUCCESS) goto error;
+    
+    /* Now queue all writes asynchronously */
+    clEnqueueWriteBuffer(rt->queue, rt->dfa_next, CL_FALSE, 0,
+                         next_size, dfa->next, 0, NULL, NULL);
+    clEnqueueWriteBuffer(rt->queue, rt->dfa_out_index, CL_FALSE, 0,
+                         index_size, dfa->out_index, 0, NULL, NULL);
+    clEnqueueWriteBuffer(rt->queue, rt->dfa_out_count, CL_FALSE, 0,
+                         count_size, dfa->out_count, 0, NULL, NULL);
+    clEnqueueWriteBuffer(rt->queue, rt->dfa_out_pat, CL_FALSE, 0,
+                         pat_size, dfa->out_pat, 0, NULL, NULL);
+    clEnqueueWriteBuffer(rt->queue, rt->dfa_sig_id, CL_FALSE, 0,
+                         sig_size, dfa->sig_id, 0, NULL, NULL);
+    clEnqueueWriteBuffer(rt->queue, rt->dfa_part_no, CL_FALSE, 0,
+                         part_size, dfa->part_no, 0, NULL, NULL);
+    
+    /* Hit buffers */
+     
+      
+    if (err != CL_SUCCESS) goto error;
+    
+ 
+    
+   
+    
+    /* Store metadata */
+    rt->dfa_states = dfa->states;
+    rt->patt_count = dfa->out_total;
+    rt->dfa_uploaded = 1;
+    rt->out_total = dfa->out_total;
+    cli_dbgmsg("GPU-Flatten: Upload successful!\n");
     return 0;
     
 error:
-    fprintf(stderr, "DFA upload failed for matcher %u\n", matcher_idx);
-    if (m->dfa_next) { clReleaseMemObject(m->dfa_next); m->dfa_next = NULL; }
-    if (m->dfa_out_index) { clReleaseMemObject(m->dfa_out_index); m->dfa_out_index = NULL; }
-    if (m->dfa_out_count) { clReleaseMemObject(m->dfa_out_count); m->dfa_out_count = NULL; }
-    if (m->dfa_out_pat) { clReleaseMemObject(m->dfa_out_pat); m->dfa_out_pat = NULL; }
-    if (m->dfa_sig_id) { clReleaseMemObject(m->dfa_sig_id); m->dfa_sig_id = NULL; }
-    if (m->dfa_part_no) { clReleaseMemObject(m->dfa_part_no); m->dfa_part_no = NULL; }
-    m->uploaded = 0;
+    cli_errmsg("GPU-Flatten: Upload failed (err=%d)\n", err);
+    /* Only release what THIS call created, not the entire runtime */
+    if (rt->dfa_next) { clReleaseMemObject(rt->dfa_next); rt->dfa_next = NULL; }
+    if (rt->dfa_out_index) { clReleaseMemObject(rt->dfa_out_index); rt->dfa_out_index = NULL; }
+    if (rt->dfa_out_count) { clReleaseMemObject(rt->dfa_out_count); rt->dfa_out_count = NULL; }
+    if (rt->dfa_out_pat) { clReleaseMemObject(rt->dfa_out_pat); rt->dfa_out_pat = NULL; }
+    if (rt->dfa_sig_id) { clReleaseMemObject(rt->dfa_sig_id); rt->dfa_sig_id = NULL; }
+    if (rt->dfa_part_no) { clReleaseMemObject(rt->dfa_part_no); rt->dfa_part_no = NULL; }
+    if (rt->scan_buffer) { clReleaseMemObject(rt->scan_buffer); rt->scan_buffer = NULL; }
+    rt->dfa_uploaded = 0;
     return -1;
 }
+
+
 
 void gpu_rt_destroy(struct gpu_rt *rt)
 {

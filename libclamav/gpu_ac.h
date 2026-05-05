@@ -8,7 +8,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #define GPU_MAX_LSIG_SUBSIGS 64
-#define GPU_MAX_MATCHERS 16
+#define GPU_MAX_EXPR_NODES 256
+
 #ifndef GPU_MAX_EXPR_NODES
 #define GPU_MAX_EXPR_NODES 1024  /* Add this! */
 #endif
@@ -37,47 +38,6 @@ struct gpu_job {
     
     enum { JOB_EMPTY, JOB_SUBMITTED, JOB_READY } state;
 };
-
-
-
-struct gpu_matcher_data {
-    /* DFA buffers */
-    cl_mem dfa_next;
-    cl_mem dfa_out_index;
-    cl_mem dfa_out_count;
-    cl_mem dfa_out_pat;
-    cl_mem dfa_sig_id;
-    cl_mem dfa_part_no;
-    
-    /* DFA metadata */
-    uint32_t dfa_states;
-    uint32_t out_total;
-    uint32_t pat_count;
-    
-    /* Pattern metadata buffers */
-    cl_mem d_patterns;
-    cl_mem d_pattern_bytes;
-    cl_mem d_prefix_bytes;
-    uint32_t num_patterns;
-    uint32_t num_pattern_bytes;
-    uint32_t num_prefix_bytes;
-    
-    /* Virname pool */
-    cl_mem d_virname_pool;
-    char *h_virname_pool;
-    uint32_t virname_pool_size;
-    
-    /* Logical signature buffers */
-    cl_mem d_lsig_metas;
-    cl_mem d_expr_bytecode;
-    uint32_t num_lsigs;
-    uint32_t expr_bytecode_size;
-    
-    /* Upload flag */
-    uint8_t uploaded;
-};
-
-
 
 struct gpu_pipeline {
     struct gpu_job jobs[GPU_QUEUE_DEPTH];
@@ -122,10 +82,6 @@ typedef struct gpu_lsig_meta{
     uint32_t tdb_icongrp2_offset;
     uint32_t bc_idx;
     uint32_t has_regex; 
-    uint32_t   has_filesize;     
-    uint32_t   has_ep;         
-    uint32_t   has_nos;          
-    uint32_t   has_container;   
 } gpu_lsig_meta_t;
  
 
@@ -138,7 +94,7 @@ struct gpu_ac_dfa {
     uint32_t *next;
     uint32_t *out_index;
     uint16_t *out_count;
-    uint32_t *out_pat;
+    uint16_t *out_pat;
     uint32_t out_total;
 };
 
@@ -150,7 +106,7 @@ struct gpu_flattened_dfa {
     uint32_t *next;           /* Transition table [states * 256] */
     uint32_t *out_index;      /* Output index per state */
     uint16_t *out_count;      /* Output count per state */
-    uint32_t *out_pat;        /* Pattern IDs */
+    uint16_t *out_pat;        /* Pattern IDs */
     uint32_t *sig_id;         /* Signature ID (0 = simple/single-part) */
     uint32_t *part_no;        /* Part number for multi-part signatures */
     uint32_t pat_count;       /* Total patterns */
@@ -177,28 +133,21 @@ struct gpu_multi_part_tracker {
 };
 
 
-// struct gpu_multi_tracker {
-//     uint32_t sig_id;
-//     uint32_t total_parts;
-//     uint64_t parts_found;
-//     uint32_t *offsets;
-//     uint32_t *part_nos;
-//     const char *virname;
-//     struct cli_ac_patt **patterns;
-// };
+struct gpu_multi_tracker {
+    uint32_t sig_id;
+    uint32_t total_parts;
+    uint64_t parts_found;
+    uint32_t *offsets;
+    uint32_t *part_nos;
+    const char *virname;
+    struct cli_ac_patt **patterns;
+};
 
-// cl_error_t gpu_async_submit(struct gpu_rt *rt, const unsigned char *buffer,
-//                              uint32_t length, struct cli_matcher *root);
-// cl_error_t gpu_async_collect(struct gpu_rt *rt, const unsigned char *buffer,
-//                               uint32_t length, const char **virname,
-//                               struct cli_matcher *root, cli_ctx *ctx);
-
-// cl_error_t gpu_scan_single(struct gpu_rt *rt,
-//                             const unsigned char *buffer,
-//                             uint32_t length,
-//                             struct cli_matcher *root,
-//                             uint8_t **chunk_bitmap_out,
-//                             uint32_t *num_chunks_out);
+cl_error_t gpu_async_submit(struct gpu_rt *rt, const unsigned char *buffer,
+                             uint32_t length, struct cli_matcher *root);
+cl_error_t gpu_async_collect(struct gpu_rt *rt, const unsigned char *buffer,
+                              uint32_t length, const char **virname,
+                              struct cli_matcher *root, cli_ctx *ctx);
 
 static cl_error_t gpu_validate_hits(uint32_t *hit_data, uint32_t hit_count,
                                      const unsigned char *buffer, uint32_t length,
@@ -206,7 +155,12 @@ static cl_error_t gpu_validate_hits(uint32_t *hit_data, uint32_t hit_count,
                                      struct cli_matcher *root, cli_ctx *ctx);
 
 
-
+cl_error_t gpu_scan_single(struct gpu_rt *rt,
+                            const unsigned char *buffer,
+                            uint32_t length,
+                            struct cli_matcher *root,
+                            uint8_t **chunk_bitmap_out,
+                            uint32_t *num_chunks_out);
 
 
  
@@ -227,9 +181,8 @@ typedef struct {
 
 /* ============ GPU RUNTIME STRUCTURE ============ */
 
- struct gpu_rt { 
+ struct gpu_rt {
     /* OpenCL objects */
-    
     cl_platform_id platform;
     cl_device_id device;
     cl_context context;
@@ -238,10 +191,7 @@ typedef struct {
     cl_kernel kernel; 
     cl_kernel lsig_kernel;      /* Only declare once */
     uint32_t max_trackers; 
-    
-      struct gpu_matcher_data matchers[GPU_MAX_MATCHERS];
-    
-    /* For backward compatibility - keep these until full migration */
+ 
 
     uint32_t icon_data_capacity;    
     cl_mem d_intermediates;    /* Add this */
@@ -296,7 +246,7 @@ typedef struct {
     
     /* State */
     int initialized;
-    uint32_t dfa_uploaded;
+    int dfa_uploaded;
     int v2_uploaded;
     
     /* Async state */
@@ -307,10 +257,6 @@ typedef struct {
     uint32_t async_hit_count;
     cl_event async_kernel_event;
     cl_event async_count_event;
-
- 
-    
-    uint32_t current_matcher;
     
     /* Batch processing support */
     struct {
@@ -346,7 +292,7 @@ void gpu_cache_insert(struct scan_cache *cache, const unsigned char *buf, uint32
 
 /* Flattened DFA functions */
 struct gpu_flattened_dfa *gpu_build_flattened_dfa(struct cli_matcher *root);
-int gpu_rt_upload_flattened_dfa(struct gpu_rt *rt, struct gpu_flattened_dfa *dfa, uint32_t matcher_idx);
+int gpu_rt_upload_flattened_dfa(struct gpu_rt *rt, struct gpu_flattened_dfa *dfa);
 cl_error_t cli_ac_scanbuff_gpu_flattened(
     const unsigned char *buffer,
     uint32_t length,
@@ -361,11 +307,6 @@ struct gpu_hint {
     uint32_t sig_id;
     uint32_t part_no;
 };
-
-
-
-
-/* Maximum number of matcher types */
 
 
 

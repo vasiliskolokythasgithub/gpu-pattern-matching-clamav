@@ -6022,70 +6022,42 @@ cl_error_t cl_engine_compile(struct cl_engine *engine)
         if ((ret = cli_loadpwdb(NULL, engine, 0, 1, NULL)))
             return ret;
     TASK_COMPLETE();
-  
 
    for (i = 0; i < CLI_MTARGETS; i++) {
         if ((root = engine->root[i])) {
-
-        fprintf(stderr, "\n=== PROCESSING MATCHER TYPE %d ===\n", root->type);
-        fprintf(stderr, "  root->ac_patterns = %u\n", root->ac_patterns);
-        fprintf(stderr, "  root->ac_lsigs = %u\n", root->ac_lsigs);
 
             if ((ret = cli_ac_buildtrie(root))) {
                 return ret;
             }
             TASK_COMPLETE();
 
-              uint32_t lsig_patt_count = 0;
-uint32_t simple_patt_count = 0;
-for (uint32_t i = 0; i < root->ac_patterns; i++) {
-    if (root->ac_pattable[i]) {
-        if (root->ac_pattable[i]->lsigid[0] > 0)
-            lsig_patt_count++;
-        else
-            simple_patt_count++;
-    }
-}
-fprintf(stderr, "ROOT type=%u: lsig_patterns=%u, simple_patterns=%u, total=%u\n",
-        root->type, lsig_patt_count, simple_patt_count, root->ac_patterns);
-
 #ifdef HAVE_OPENCL
-    /* Only upload DFA for type 0 and type 1 (the most important ones) */
-    //CHANGE THIS
-    if ((root->type == 0 || root->type == 1) && 
-    // if (root->type == 1 && 
-        root->gpu_flat_dfa && engine->gpu_rt && 
-        !engine->gpu_rt->matchers[root->type].uploaded) {
-
-                for (uint32_t i = 0; i < root->ac_patterns; i++) {
-        struct cli_ac_patt *p = root->ac_pattable[i];
-        if (p && p->virname && strstr(p->virname, "ZxShell-10")) {
-            fprintf(stderr, "ZxShell-10 IN ROOT[1]: pid=%u, len=%u, sigid=%u, lsigid[0]=%u\n",
-                    i, p->length[0], p->sigid, p->lsigid[0]);
-        }
-    }
-        
-        fprintf(stderr, "Uploading DFA for type %d to slot %d\n", root->type, root->type);
-        if (gpu_rt_upload_flattened_dfa(engine->gpu_rt, root->gpu_flat_dfa, root->type) == 0) {
-            if (gpu_upload_pattern_metadata(engine->gpu_rt, root, root->type) == 0) {
-                if (gpu_upload_logical_signatures(engine->gpu_rt, root, root->type) == 0) {
-                    cli_dbgmsg("GPU: All uploaded for type %d\n", root->type);
+    if (root->gpu_flat_dfa && 
+        engine->gpu_rt && 
+        !engine->gpu_rt->dfa_uploaded)
+    {
+        if (gpu_rt_upload_flattened_dfa(engine->gpu_rt, root->gpu_flat_dfa) == 0) {
+            cli_dbgmsg("GPU: Flattened DFA uploaded successfully\n");
+            
+            if (gpu_upload_pattern_metadata(engine->gpu_rt, root) == 0) {
+                cli_dbgmsg("GPU: Pattern metadata uploaded successfully\n");
+                
+                /* Add logical signatures upload */
+                if (gpu_upload_logical_signatures(engine->gpu_rt, root) == 0) {
+                    cli_dbgmsg("GPU: Logical signatures uploaded successfully\n");
+                } else {
+                    cli_warnmsg("GPU: Logical signatures upload failed (continuing without LSIG)\n");
                 }
+                
+                root->gpu_enabled = 1;
+                
+            } else {
+                root->gpu_enabled = 0;
+                cli_dbgmsg("GPU: Pattern metadata upload failed\n");
             }
-            engine->gpu_rt->matchers[root->type].uploaded = 1;
-            root->gpu_enabled = 1;
-            fprintf(stderr, "GPU ENABLED for type %d\n", root->type);
-
-              if (root->gpu_flat_dfa) {
-                    free(root->gpu_flat_dfa->next);
-                    free(root->gpu_flat_dfa->out_index);
-                    free(root->gpu_flat_dfa->out_count);
-                    free(root->gpu_flat_dfa->out_pat);
-                    free(root->gpu_flat_dfa->sig_id);
-                    free(root->gpu_flat_dfa->part_no);
-                    free(root->gpu_flat_dfa);
-                    root->gpu_flat_dfa = NULL;
-                }
+        } else {
+            root->gpu_enabled = 0;
+            cli_dbgmsg("GPU: Flattened DFA upload failed\n");
         }
     }
 #endif
@@ -6102,7 +6074,7 @@ fprintf(stderr, "ROOT type=%u: lsig_patterns=%u, simple_patterns=%u, total=%u\n"
     #endif
         }
     }
-fprintf(stderr, "AFTER LOOP POST-UPLOAD i=%d: rt->dfa_states=%u\n", i, engine->gpu_rt->dfa_states);
+
 
     if (engine->hm_hdb)
         hm_flush(engine->hm_hdb);

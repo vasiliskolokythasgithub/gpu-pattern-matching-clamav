@@ -108,7 +108,7 @@ struct cli_ac_patt {
     uint32_t boundary;
     uint8_t depth;
     uint8_t sigopts;
-    uint32_t gpu_id;
+    uint16_t gpu_id;
 };
 
 struct cli_ac_list {

@@ -1,11 +1,12 @@
 
 /* Constants section */
-#define GPU_MATCH_CHAR        0x0000
-#define GPU_MATCH_IGNORE      0x0200
-#define GPU_MATCH_NOCASE      0x0400
-#define GPU_MATCH_NIBBLE_HIGH 0x0100
-#define GPU_MATCH_NIBBLE_LOW  0x0300
 #define GPU_MATCH_METADATA    0xFF00
+#define GPU_MATCH_CHAR        0x0000
+#define GPU_MATCH_IGNORE      0x0100    
+#define GPU_MATCH_SPECIAL     0x0200
+#define GPU_MATCH_NIBBLE_HIGH 0x0300
+#define GPU_MATCH_NIBBLE_LOW  0x0400
+#define GPU_MATCH_NOCASE      0x1000   
 #define CLI_MATCH_METADATA    0xFF00
 #define CLI_MATCH_CHAR        0x0000
 #define CLI_MATCH_IGNORE      0x0200
@@ -703,7 +704,7 @@ __kernel void ac_scan_validate(
                 return;
             }
             
-            if (patt->type != 0) { continue; }
+            
             if (patt->depth == 0) { continue; }
             if (pos < patt->depth - 1) continue;
             
@@ -1034,10 +1035,28 @@ __kernel void evaluate_logical_sigs(
                     count_stack[sp-1] = a || b;
                 }
                 break;
+
+            case OP_NOT:
+                if (sp >= 1) {
+                    count_stack[sp-1] = !count_stack[sp-1];
+                }
+                break;
+
+            case OP_EQ:
+                if (sp >= 1) {
+                    count_stack[sp-1] = (count_stack[sp-1] == operand);
+                }
+                break;
+
+            case OP_LT:
+                if (sp >= 1) {
+                    count_stack[sp-1] = (count_stack[sp-1] < operand);
+                }
+                break;
                 
             case OP_END:
                 if (sp >= 1) {
-                    if (count_stack[0]) {
+                    if (sp == 1 && count_stack[0]){
                         /* TDB validation */
                         if (meta->tdb_container && meta->tdb_container != container_type) {
                             return;

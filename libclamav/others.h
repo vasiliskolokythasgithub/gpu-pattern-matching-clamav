@@ -357,10 +357,7 @@ struct cl_engine {
     char *tmpdir;
     uint32_t keeptmp;
     uint64_t engine_options;
-#ifdef HAVE_OPENCL
-    struct gpu_flattened_dfa *gpu_dfa;  // Store GPU DFA here
-    struct cli_matcher *gpu_matcher;    // Optional: store GPU matcher copy
-#endif
+
     /* Limits */
     uint32_t maxscantime;         /* Time limit (in milliseconds) */
     uint64_t maxscansize;         /* during the scanning of archives this size

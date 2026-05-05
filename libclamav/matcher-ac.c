@@ -644,7 +644,7 @@ cl_error_t cli_ac_buildtrie(struct cli_matcher *root)
             root ? root->type : 999, (void*)root);
     
     if (!root) return CL_EMALFDB;
-    if (!root->ac_root) return CL_SUCCESS;
+    if (!root->ac_root) return CL_EMALFDB;
 
     fprintf(stderr, "  link_llists for type %u\n", root->type);
     link_lists(root);
@@ -652,21 +652,7 @@ cl_error_t cli_ac_buildtrie(struct cli_matcher *root)
     fprintf(stderr, "  ac_maketrans for type %u\n", root->type);
     ac_maketrans(root);
     
-
-    //CHANGE THIS
 #ifdef HAVE_OPENCL
-
-if (root->type == 0) {
-        uint32_t *saved_state_ids = NULL;
-    if (root->ac_nodes > 0) {
-        saved_state_ids = malloc(root->ac_nodes * sizeof(uint32_t));
-        for (uint32_t i = 0; i < root->ac_nodes; i++) {
-            if (root->ac_nodetable[i]) {
-                saved_state_ids[i] = root->ac_nodetable[i]->gpu_state_id;
-                root->ac_nodetable[i]->gpu_state_id = UINT32_MAX;
-            }
-        }
-    }
     /* FIRST: Assign GPU IDs to all patterns */
     uint32_t new_gpu_id = 0;
     for (uint32_t i = 0; i < root->ac_patterns; i++) {
@@ -675,7 +661,6 @@ if (root->type == 0) {
         }
     }
     root->gpu_patt_count = new_gpu_id;
-    //root->gpu_patt_count = root->ac_patterns; 
     
     fprintf(stderr, "  gpu_patt_count=%u for type %u (after ID assignment)\n", 
             root->gpu_patt_count, root->type);
@@ -704,20 +689,11 @@ if (root->type == 0) {
             root->gpu_dfa_ready = 1;
         }
     }
-     if (saved_state_ids) {
-        for (uint32_t i = 0; i < root->ac_nodes; i++) {
-            if (root->ac_nodetable[i]) {
-                root->ac_nodetable[i]->gpu_state_id = saved_state_ids[i];
-            }
-        }
-        free(saved_state_ids);
-    }
-}
 #endif
 
     fprintf(stderr, "=== cli_ac_buildtrie END === type=%u\n", root->type);
     return CL_SUCCESS;
-} 
+}
 cl_error_t cli_ac_init(struct cli_matcher *root, uint8_t mindepth, uint8_t maxdepth, uint8_t dconf_prefiltering)
 {
 #ifdef USE_MPOOL
@@ -1976,7 +1952,7 @@ cl_error_t cli_ac_scanbuff(
      * ============================================================ */
     //fprintf(stderr, "MATCHER: Starting CPU scan, length=%u\n", length);
 
-// cpu_scan:
+cpu_scan:
    current = root->ac_root;
 
     for (i = 0; i < length; i++) {
@@ -2774,8 +2750,7 @@ cl_error_t cli_ac_addsig(struct cli_matcher *root, const char *virname, const ch
     return CL_EMEM;
 
 /* === GPU STEP 4: assign stable GPU pattern ID === */
-    // new->gpu_id = root->gpu_patt_count++;
-    new->gpu_id = 0; 
+    new->gpu_id = root->gpu_patt_count++;
     new->rtype      = rtype;
     new->type       = type;
     new->sigid      = sigid;
@@ -3301,37 +3276,63 @@ cl_error_t cli_ac_addsig(struct cli_matcher *root, const char *virname, const ch
 
 uint32_t gpu_assign_state_ids(struct cli_ac_node *root, struct cli_ac_node ***out)
 {
-    uint32_t cap = 524288;
+    uint32_t cap = 65536;  /* Start with a larger capacity */
     uint32_t count = 0;
     struct cli_ac_node **q = cli_malloc(cap * sizeof(*q));
+    
     if (!q) return 0;
 
+    /* Reset all state IDs first */
+    root->gpu_state_id = UINT32_MAX;
+    
+    /* BFS queue */
+    struct cli_ac_node **queue = cli_malloc(cap * sizeof(*queue));
+    if (!queue) {
+        free(q);
+        return 0;
+    }
+    
+    uint32_t head = 0, tail = 0;
+    
+    /* Start with root */
     root->gpu_state_id = 0;
     q[0] = root;
+    queue[tail++] = root;
     count = 1;
-
-    for (uint32_t head = 0; head < count; head++) {
-        struct cli_ac_node *current = q[head];
-        if (!current->trans) continue;
-
+    
+    while (head < tail) {
+        struct cli_ac_node *current = queue[head++];
+        
+        /* Process all transitions */
         for (int c = 0; c < 256; c++) {
-            struct cli_ac_node *child = current->trans[c];
+            struct cli_ac_node *child = current->trans ? current->trans[c] : NULL;
+            
             if (child && child->gpu_state_id == UINT32_MAX) {
                 child->gpu_state_id = count;
+                q[count] = child;
+                queue[tail++] = child;
+                count++;
+                
+                /* Resize if needed */
                 if (count >= cap) {
                     cap *= 2;
                     struct cli_ac_node **newq = cli_realloc(q, cap * sizeof(*q));
-                    if (!newq) {
+                    struct cli_ac_node **newqueue = cli_realloc(queue, cap * sizeof(*queue));
+                    if (!newq || !newqueue) {
                         free(q);
+                        free(queue);
                         return 0;
                     }
                     q = newq;
+                    queue = newqueue;
                 }
-                q[count++] = child;
             }
         }
     }
-
+    
+    free(queue);
     *out = q;
+    
+    cli_dbgmsg("GPU-DFA: Assigned %u state IDs\n", count);
     return count;
 }
