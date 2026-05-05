@@ -290,75 +290,51 @@ static int build_lsig_bytecode(const char *logic,
                                 uint32_t max_nodes,
                                 int *uses_zero_based)
 {
+    if (!logic || !bytecode || max_nodes < 2) return -1;
+    
     uint32_t pos = 0;
-    uint32_t stack[32];
-    uint32_t sp = 0;
     
-    if (!logic || !bytecode) return -1;
-    
-    /* For simple expressions like "0&1&2" or "0|1|2" */
+    /* Simple parser for now - just handle "0&1&2&3&4" format */
     const char *ptr = logic;
-    uint32_t first_op = 0;
-    char op_type = 0;
+    uint32_t operands[32];
+    uint32_t num_ops = 0;
+    char op_type = '&';  /* default AND */
     
-    /* Parse the first operand */
-    while (*ptr && (*ptr < '0' || *ptr > '9')) ptr++;
-    if (!*ptr) return -1;
-    
-    first_op = atoi(ptr);
-    *uses_zero_based = (first_op == 0); /* Detect if using 0-based indexing */
-    
-    /* Find the operator */
-    while (*ptr && *ptr != '&' && *ptr != '|') ptr++;
-    if (*ptr) {
-        op_type = *ptr;
+    /* Parse operands */
+    while (*ptr && num_ops < 32) {
+        if (*ptr >= '0' && *ptr <= '9') {
+            operands[num_ops++] = atoi(ptr);
+            while (*ptr && (*ptr >= '0' && *ptr <= '9')) ptr++;
+        } else if (*ptr == '&') {
+            op_type = '&';
+            ptr++;
+        } else if (*ptr == '|') {
+            op_type = '|';
+            ptr++;
+        } else {
+            ptr++;
+        }
     }
     
-    if (op_type == 0) {
-        /* Single operand - just LOAD it */
-        if (pos >= max_nodes) return -1;
-        bytecode[pos].op = 0; /* LOAD */
-        bytecode[pos].operand = first_op;
+    if (num_ops == 0) return -1;
+    
+    /* Generate LOADs */
+    if (pos + num_ops + 1 > max_nodes) return -1;
+    for (uint32_t i = 0; i < num_ops; i++) {
+        bytecode[pos].op = 0;  /* LOAD */
+        bytecode[pos].operand = operands[i];
         pos++;
-    } else {
-        /* Multiple operands with same operator */
-        uint32_t operands[32];
-        uint32_t num_ops = 0;
-        
-        /* Collect all operands */
-        ptr = logic;
-        while (*ptr) {
-            while (*ptr && (*ptr < '0' || *ptr > '9')) ptr++;
-            if (*ptr) {
-                operands[num_ops++] = atoi(ptr);
-                while (*ptr && (*ptr >= '0' && *ptr <= '9')) ptr++;
-            }
-        }
-        
-        /* Generate LOADs */
-        for (uint32_t i = 0; i < num_ops; i++) {
-            if (pos >= max_nodes) return -1;
-            bytecode[pos].op = 0; /* LOAD */
-            bytecode[pos].operand = operands[i];
-            pos++;
-        }
-        
-        /* Generate operators */
-        for (uint32_t i = 1; i < num_ops; i++) {
-            if (pos >= max_nodes) return -1;
-            if (op_type == '&') {
-                bytecode[pos].op = 1; /* AND */
-            } else if (op_type == '|') {
-                bytecode[pos].op = 2; /* OR */
-            }
-            bytecode[pos].operand = 0;
-            pos++;
-        }
     }
     
-    /* Add END opcode */
-    if (pos >= max_nodes) return -1;
-    bytecode[pos].op = 4; /* END */
+    /* Generate operators */
+    for (uint32_t i = 1; i < num_ops; i++) {
+        bytecode[pos].op = (op_type == '&') ? 1 : 2;  /* AND=1, OR=2 */
+        bytecode[pos].operand = 0;
+        pos++;
+    }
+    
+    /* END opcode */
+    bytecode[pos].op = 4;
     bytecode[pos].operand = 0;
     pos++;
     
@@ -429,7 +405,7 @@ static int get_expr_type(const char *expr)
     }
     
     /* First pass: calculate total bytecode size - we need a better estimate now */
-    uint32_t total_expr_nodes = num_lsigs * 64; /* Overestimate to be safe */
+    uint32_t total_expr_nodes = num_lsigs * 256; /* Overestimate to be safe */
     
     /* Allocate host arrays */
     gpu_lsig_meta_t *h_metas = calloc(num_lsigs, sizeof(gpu_lsig_meta_t));
@@ -444,9 +420,24 @@ static int get_expr_type(const char *expr)
     uint32_t current_pos = 0;
     for (uint32_t i = 0; i < num_lsigs; i++) {
         struct cli_ac_lsig *lsig = root->ac_lsigtable[i];
+         if (lsig && lsig->virname && 
+        (strstr(lsig->virname, "Generic-6628741") || 
+         strstr(lsig->virname, "Pemalform-7192299"))) {
+        fprintf(stderr, "FOUND: LSIG[%u] sig_id=%u virname='%s' subsigs=%u expr='%s'\n",
+                i, i+1, lsig->virname, lsig->tdb.subsigs,
+                lsig->u.logic ? lsig->u.logic : "NULL");
+        for (uint32_t s = 0; s < root->ac_patterns; s++) {
+            struct cli_ac_patt *p = root->ac_pattable[s];
+            if (p && p->lsigid[0] && p->lsigid[1] == i+1) {
+                fprintf(stderr, "  subsig[%u]: len=%u, offdata[0]=%u, depth=%u\n",
+                        p->lsigid[2], p->length[0], p->offdata[0], p->depth);
+            }
+        }
+    }
         if (!lsig) continue;
         
         gpu_lsig_meta_t *meta = &h_metas[i];
+       
         
         meta->sig_id = i + 1;  
         meta->num_subsigs = lsig->tdb.subsigs;
@@ -548,6 +539,20 @@ static int get_expr_type(const char *expr)
     }
     
     
+    /* Debug: print selected LSIG metadata entries for inspection */
+    {
+        uint32_t debug_idxs[] = {50802u, 554142u, 559495u};
+        size_t di_count = sizeof(debug_idxs) / sizeof(debug_idxs[0]);
+        for (size_t di = 0; di < di_count; di++) {
+            uint32_t idx = debug_idxs[di];
+            if (idx < num_lsigs) {
+                gpu_lsig_meta_t *m = &h_metas[idx];
+                fprintf(stderr, "DBG LSIG META: idx=%u sig_id=%u virname_off=%u virname_len=%u expr_off=%u expr_len=%u num_subsigs=%u\n",
+                        idx, m->sig_id, m->virname_offset, m->virname_len, m->expr_offset, m->expr_length, m->num_subsigs);
+            }
+        }
+    }
+
     /* Upload to GPU */
     rt->d_lsig_metas = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                        num_lsigs * sizeof(gpu_lsig_meta_t),
@@ -565,14 +570,30 @@ static int get_expr_type(const char *expr)
     fprintf(stderr, "GPU LSIG: Uploaded %u signatures, %u expr nodes\n",
             num_lsigs, current_pos);
     
+    /* Update the GPU virname pool with the new logical signature virnames */
+    if (rt->virname_pool_size > 0 && rt->h_virname_pool) {
+        if (rt->d_virname_pool) {
+            clReleaseMemObject(rt->d_virname_pool);
+        }
+        rt->d_virname_pool = clCreateBuffer(rt->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                            rt->virname_pool_size,
+                                            rt->h_virname_pool, &err);
+        if (err != CL_SUCCESS) {
+            cli_errmsg("GPU: Failed to upload virname pool to GPU: %d\n", err);
+            goto error;
+        }
+        fprintf(stderr, "GPU LSIG: Updated virname pool on GPU (size=%u)\n", rt->virname_pool_size);
+    }
 
             fprintf(stderr, "=== LOGICAL SIGNATURES IN ROOT ===\n");
 for (uint32_t i = 0; i < root->ac_lsigs; i++) {
     struct cli_ac_lsig *lsig = root->ac_lsigtable[i];
+    
     // if (lsig) {
     //     fprintf(stderr, "  LSIG[%u]: sig_id should be %u, virname='%s', subsigs=%u\n",
     //             i, i+1, lsig->virname ? lsig->virname : "NULL", lsig->tdb.subsigs);
     // }
+    
 }
     free(h_metas);
     free(h_bytecode);
@@ -625,9 +646,18 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt,
     for (uint32_t i = 0; i < np; i++) {
         struct cli_ac_patt *p = root->gpu_patt_lookup[i];
         if (!p) {
-            fprintf(stderr, "  WARNING: gpu_patt_lookup[%u] is NULL\n", i);
+            // fprintf(stderr, "  WARNING: gpu_patt_lookup[%u] is NULL\n", i);
             continue;
         }
+        if (p->virname && 
+        (strstr(p->virname, "Generic-6628741") ||
+         strstr(p->virname, "Pemalform-7192299"))) {
+        fprintf(stderr, "FOUND PATTERN: pid=%u, sigid=%u, parts=%u, partno=%u, "
+                "lsigid=[%u,%u,%u], offdata[0]=%u, len=%u, depth=%u\n",
+                i, p->sigid, p->parts, p->partno,
+                p->lsigid[0], p->lsigid[1], p->lsigid[2],
+                p->offdata[0], p->length[0], p->depth);
+    }
         total_pat_bytes += p->length[0];
         total_pfx_bytes += p->prefix_length[0];
         if (p->virname)
@@ -688,7 +718,15 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt,
     for (uint32_t i = 0; i < np; i++) {
         struct cli_ac_patt *p = root->gpu_patt_lookup[i];
         if (!p) continue;
-        
+        if (p->virname && 
+        (strstr(p->virname, "Generic-6628741") ||
+         strstr(p->virname, "Pemalform-7192299"))) {
+        fprintf(stderr, "FOUND PATTERN: pid=%u, sigid=%u, parts=%u, partno=%u, "
+                "lsigid=[%u,%u,%u], offdata[0]=%u, len=%u, depth=%u\n",
+                i, p->sigid, p->parts, p->partno,
+                p->lsigid[0], p->lsigid[1], p->lsigid[2],
+                p->offdata[0], p->length[0], p->depth);
+    }
         gpu_pattern_t *gp = &h_patterns[i];
         uint16_t max_depth = root->ac_maxdepth;
  
@@ -720,10 +758,10 @@ int gpu_upload_pattern_metadata(struct gpu_rt *rt,
                     struct cli_ac_lsig *lsig = root->ac_lsigtable[lsig_idx - 1];
                     if (lsig) {
                         gp->has_regex = lsig->has_regex;  // Copy from the logical signature
-                        if (gp->has_regex) {
-                            fprintf(stderr, "GPU UPLOAD: Pattern[%u] inherits regex flag from lsig %u\n", 
-                                    i, lsig_idx);
-                        }
+                        // if (gp->has_regex) {
+                        //     fprintf(stderr, "GPU UPLOAD: Pattern[%u] inherits regex flag from lsig %u\n", 
+                        //             i, lsig_idx);
+                        // }
                     }
                 }
             }
@@ -947,6 +985,7 @@ int gpu_scan(struct gpu_rt *rt,
    
     /* Reset result to CLEAN */
     gpu_scan_result_t zero_result = {0};
+    zero_result.sig_id = 0xFFFFFFFFu;  /* Initialize sig_id to max so any sig_id is lower */
     clEnqueueWriteBuffer(rt->queue, rt->d_result, CL_FALSE,
                           0, sizeof(gpu_scan_result_t), &zero_result, 0, NULL, NULL);
 

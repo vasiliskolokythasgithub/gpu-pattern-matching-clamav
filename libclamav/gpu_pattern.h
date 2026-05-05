@@ -81,7 +81,7 @@ typedef struct {
     uint32_t needs_cpu_fallback;  
     uint32_t fallback_offset;      
     uint32_t fallback_pattern_id;  
-    uint32_t specials_skipped;  
+    uint32_t sig_id;  /* Track which signature matched for priority */
 } gpu_scan_result_t;  
 
 #endif /* GPU_PATTERN_H */

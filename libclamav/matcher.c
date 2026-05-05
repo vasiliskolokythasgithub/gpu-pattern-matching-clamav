@@ -1345,10 +1345,12 @@ cl_error_t cli_scan_fmap(cli_ctx *ctx, cli_file_t ftype, bool filetype_only, str
 //      fprintf(stderr, "  PE FILE SKIPPING TO CPU\n");
 //     goto cpu_scan;
 // }
-    if (generic_ac_root && generic_ac_root->gpu_enabled && 
-        generic_ac_root->gpu_dfa_states &&
-        ctx->engine->gpu_rt && ctx->engine->gpu_rt->dfa_uploaded  &&
-        ctx->fmap->len >=  256 * 1024) {
+if (ctx->engine->root[1] && 
+    target_ac_root == ctx->engine->root[1] &&
+    ctx->engine->root[1]->gpu_enabled &&
+    ctx->engine->gpu_rt && 
+    ctx->engine->gpu_rt->dfa_uploaded &&
+    ctx->fmap && ctx->fmap->len >= 256 * 1024) {
         
         const unsigned char *full_buf = fmap_need_off_once(ctx->fmap, 0, ctx->fmap->len);
         if (full_buf) {
@@ -1356,7 +1358,7 @@ cl_error_t cli_scan_fmap(cli_ctx *ctx, cli_file_t ftype, bool filetype_only, str
          int gpu_rc = gpu_scan(ctx->engine->gpu_rt, full_buf,
                       (uint32_t)ctx->fmap->len,
                       &gpu_virname,
-                      generic_ac_root->maxpatlen,
+                      ctx->engine->root[1]->maxpatlen,
                       ctx,
                       &info); 
             if (gpu_rc == GPU_RESULT_VIRUS && gpu_virname) {

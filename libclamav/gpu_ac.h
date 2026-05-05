@@ -83,7 +83,7 @@ typedef struct gpu_lsig_meta{
     uint32_t bc_idx;
     uint32_t has_regex; 
 } gpu_lsig_meta_t;
- 
+
 
  
 /* ============ LEGACY DFA STRUCTURE ============ */

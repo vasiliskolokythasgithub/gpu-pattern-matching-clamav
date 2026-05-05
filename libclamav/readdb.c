@@ -6032,7 +6032,7 @@ cl_error_t cl_engine_compile(struct cl_engine *engine)
             TASK_COMPLETE();
 
 #ifdef HAVE_OPENCL
-    if (root->gpu_flat_dfa && 
+    if (i== 1 && root->gpu_flat_dfa && 
         engine->gpu_rt && 
         !engine->gpu_rt->dfa_uploaded)
     {
